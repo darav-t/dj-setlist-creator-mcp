@@ -146,6 +146,7 @@ async def generate_setlist(
                 "energy": st.track.energy,
                 "genre": st.track.genre,
                 "duration": st.track.duration_formatted(),
+                "file_path": st.track.file_path,
                 "key_relation": st.key_relation,
                 "transition_score": st.transition_score,
                 "notes": st.notes,
@@ -196,6 +197,7 @@ async def recommend_next_track(
             "energy": r.track.energy,
             "genre": r.track.genre,
             "duration": r.track.duration_formatted(),
+            "file_path": r.track.file_path,
             "overall_score": r.score,
             "harmonic_score": r.harmonic_score,
             "energy_score": r.energy_score,
@@ -315,7 +317,7 @@ async def analyze_energy_flow(
         "issues": issues,
         "score": round(1.0 - len(issues) / max(n, 1), 2),
         "tracks_found": [
-            {"title": t.title, "energy": t.energy, "key": t.key, "bpm": t.bpm}
+            {"title": t.title, "energy": t.energy, "key": t.key, "bpm": t.bpm, "file_path": t.file_path}
             if t else None
             for t in found_tracks
         ],
@@ -390,6 +392,7 @@ async def get_compatible_tracks(
             "energy": track.energy,
             "genre": track.genre,
             "rating": track.rating,
+            "file_path": track.file_path,
             "harmonic_score": h_score,
             "key_relationship": rel,
         })
