@@ -471,14 +471,20 @@ async def get_library_summary() -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_library(
-    query: str,
+    query: str = "",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    my_tag: Optional[str] = None,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
     """
     Search the Rekordbox library for tracks.
 
     Args:
-        query: Search string (matches title, artist, album, genre)
+        query: Search string (matches title, artist, album, genre). Optional.
+        date_from: Filter tracks added on or after this date (YYYY-MM-DD). Optional.
+        date_to: Filter tracks added on or before this date (YYYY-MM-DD). Optional.
+        my_tag: Filter by Rekordbox My Tag label (e.g. 'High Energy'). Optional.
         limit: Maximum results (default 20)
 
     Returns:
@@ -487,27 +493,47 @@ async def search_library(
     await _ensure_initialized()
 
     q = query.strip().lower()
+    tag_filter = (my_tag or "").strip().lower()
     results = []
+
     for t in engine.tracks:
-        if (q in t.title.lower()
-                or q in t.artist.lower()
-                or q in (t.genre or "").lower()
-                or q in (t.album or "").lower()):
-            results.append({
-                "id": t.id,
-                "artist": t.artist,
-                "title": t.title,
-                "bpm": t.bpm,
-                "key": t.key,
-                "energy": t.energy,
-                "energy_source": t.energy_source,
-                "genre": t.genre,
-                "rating": t.rating,
-                "play_count": t.play_count,
-                "duration": t.duration_formatted(),
-            })
-            if len(results) >= limit:
-                break
+        # Text filter
+        if q and not (
+            q in t.title.lower()
+            or q in t.artist.lower()
+            or q in (t.genre or "").lower()
+            or q in (t.album or "").lower()
+        ):
+            continue
+
+        # Date filter (lexicographic comparison works for YYYY-MM-DD)
+        d = t.date_added or ""
+        if date_from and d < date_from:
+            continue
+        if date_to and d > date_to:
+            continue
+
+        # My Tag filter
+        if tag_filter and not any(tag_filter in tag.lower() for tag in t.my_tags):
+            continue
+
+        results.append({
+            "id": t.id,
+            "artist": t.artist,
+            "title": t.title,
+            "bpm": t.bpm,
+            "key": t.key,
+            "energy": t.energy,
+            "energy_source": t.energy_source,
+            "genre": t.genre,
+            "rating": t.rating,
+            "play_count": t.play_count,
+            "duration": t.duration_formatted(),
+            "date_added": t.date_added,
+            "my_tags": t.my_tags,
+        })
+        if len(results) >= limit:
+            break
 
     return results
 

@@ -97,15 +97,28 @@ TOOLS = [
     {
         "name": "search_library",
         "description": (
-            "Search the DJ's Rekordbox library by text query. "
-            "Use to look up specific tracks, artists, or genres."
+            "Search the DJ's Rekordbox library by text query, date added, or My Tag. "
+            "Use to look up specific tracks, artists, genres, recently added tracks, "
+            "or tracks with specific Rekordbox My Tag labels."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (matches title, artist, album, genre)",
+                    "description": "Search query (matches title, artist, album, genre). Optional.",
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "Filter tracks added on or after this date (YYYY-MM-DD). Optional.",
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "Filter tracks added on or before this date (YYYY-MM-DD). Optional.",
+                },
+                "my_tag": {
+                    "type": "string",
+                    "description": "Filter by Rekordbox My Tag label (e.g. 'High Energy', 'Renegade'). Optional.",
                 },
                 "limit": {
                     "type": "integer",
@@ -113,7 +126,6 @@ TOOLS = [
                     "default": 20,
                 },
             },
-            "required": ["query"],
         },
     },
     {
@@ -184,6 +196,11 @@ LIBRARY SUMMARY:
 - Top genres: {', '.join(stats.get('top_genres', [])[:8])}
 - Top keys: {stats.get('key_summary', 'N/A')}
 - Energy range: {stats.get('energy_min', 0)} - {stats.get('energy_max', 0)}
+- Date range: {stats.get('date_min', 'N/A')} to {stats.get('date_max', 'N/A')}
+- My Tags available: {', '.join(stats.get('top_my_tags', [])) or 'none'}
+
+TRACK FIELDS: Each track has title, artist, genre, bpm, key, energy, rating, date_added (YYYY-MM-DD), my_tags (list of Rekordbox My Tag labels).
+Use search_library with date_from/date_to to find recently added tracks, and my_tag to filter by My Tag label.
 
 ENERGY PROFILES: {profiles}
 
@@ -411,26 +428,47 @@ Keep responses concise but informative. Format track names as "Artist - Title"."
     async def _tool_search_library(self, input: Dict) -> Dict:
         """Handle search_library tool call."""
         query = input.get("query", "")
+        date_from = input.get("date_from", "")
+        date_to = input.get("date_to", "")
+        my_tag = (input.get("my_tag") or "").strip().lower()
         limit = input.get("limit", 20)
 
         results = []
         q = query.strip().lower()
         for t in self.engine.tracks:
-            if (q in t.title.lower()
-                    or q in t.artist.lower()
-                    or q in (t.genre or "").lower()):
-                results.append({
-                    "id": t.id,
-                    "artist": t.artist,
-                    "title": t.title,
-                    "bpm": t.bpm,
-                    "key": t.key,
-                    "energy": t.energy,
-                    "genre": t.genre,
-                    "rating": t.rating,
-                })
-                if len(results) >= limit:
-                    break
+            # Text filter (skip if query given and nothing matches)
+            if q and not (
+                q in t.title.lower()
+                or q in t.artist.lower()
+                or q in (t.genre or "").lower()
+            ):
+                continue
+
+            # Date filter
+            d = t.date_added or ""
+            if date_from and d < date_from:
+                continue
+            if date_to and d > date_to:
+                continue
+
+            # My Tag filter
+            if my_tag and not any(my_tag in tag.lower() for tag in t.my_tags):
+                continue
+
+            results.append({
+                "id": t.id,
+                "artist": t.artist,
+                "title": t.title,
+                "bpm": t.bpm,
+                "key": t.key,
+                "energy": t.energy,
+                "genre": t.genre,
+                "rating": t.rating,
+                "date_added": t.date_added,
+                "my_tags": t.my_tags,
+            })
+            if len(results) >= limit:
+                break
 
         return {"results": results, "count": len(results)}
 

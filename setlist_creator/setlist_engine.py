@@ -550,14 +550,21 @@ class SetlistEngine:
 
         genre_counts: Dict[str, int] = {}
         key_counts: Dict[str, int] = {}
+        tag_counts: Dict[str, int] = {}
+        dates = []
         for t in self.tracks:
             if t.genre:
                 genre_counts[t.genre] = genre_counts.get(t.genre, 0) + 1
             if t.key:
                 key_counts[t.key] = key_counts.get(t.key, 0) + 1
+            for tag in t.my_tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if t.date_added:
+                dates.append(t.date_added)
 
         top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         top_keys = sorted(key_counts.items(), key=lambda x: x[1], reverse=True)[:12]
+        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
         return {
             "total": len(self.tracks),
@@ -569,4 +576,7 @@ class SetlistEngine:
             "top_genres": [f"{g} ({c})" for g, c in top_genres],
             "top_keys": [f"{k} ({c})" for k, c in top_keys],
             "key_summary": ", ".join(f"{k}: {c}" for k, c in top_keys[:6]),
+            "date_min": min(dates) if dates else "N/A",
+            "date_max": max(dates) if dates else "N/A",
+            "top_my_tags": [f"{tag} ({c})" for tag, c in top_tags],
         }
