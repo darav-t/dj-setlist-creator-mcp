@@ -395,7 +395,7 @@ PYEOF
       ) || MCP_ENV_JSON="{}"
     fi
 
-    # Merge mcp-dj entry into the Claude Desktop config
+    # Merge mcp-dj entry into the Claude Desktop config (bash + venv style, like claude_desktop_config.json)
     python3 - "$CLAUDE_DESKTOP_CONFIG" "$SCRIPT_DIR" "$MCP_ENV_JSON" <<'PYEOF'
 import json, sys, os
 config_path, project_dir, env_json = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -416,10 +416,20 @@ try:
 except Exception:
     env = {}
 
-entry = {
-    "command": "uv",
-    "args": ["run", "--project", project_dir, "python", "-m", "mcp_dj.mcp_server"]
-}
+# Escape project_dir for use inside single-quoted shell string: ' -> '\''
+project_dir_escaped = project_dir.replace("'", "'\"'\"'")
+
+if sys.platform == "win32":
+    project_dir_win = project_dir.replace("/", "\\")
+    entry = {
+        "command": "cmd",
+        "args": ["/c", "cd /d \"%s\" && .venv\\Scripts\\python.exe -m mcp_dj.mcp_server" % project_dir_win]
+    }
+else:
+    entry = {
+        "command": "/bin/bash",
+        "args": ["-c", "cd '%s' && exec .venv/bin/python3 -m mcp_dj.mcp_server" % project_dir_escaped]
+    }
 if env:
     entry["env"] = env
 

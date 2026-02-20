@@ -7,9 +7,9 @@ harmonic compatibility — callable directly from Claude Desktop.
 To connect to Claude Desktop, add to claude_desktop_config.json:
 {
   "mcpServers": {
-    "dj-setlist-creator": {
+    "mcp-dj": {
       "command": "uv",
-      "args": ["run", "--project", "/path/to/set_list_creator", "python", "-m", "mcp_dj.mcp_server"],
+      "args": ["run", "--project", "/path/to/mcp_dj", "python", "-m", "mcp_dj.mcp_server"],
       "env": {}
     }
   }

@@ -175,12 +175,34 @@ To enable:
 
 ## Claude Desktop Integration (MCP)
 
-1. Open `claude_desktop_config.json` in this repo
-2. Replace `/path/to/set_list_creator` with the absolute path to where you cloned this repo
-3. Merge the `mcpServers` block into your Claude Desktop config:
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-4. Restart Claude Desktop
+The MCP server runs via your project’s virtualenv (`.venv`). Use the same style for each platform:
+
+1. Open `claude_desktop_config.json` in this repo.
+2. Replace `/path/to/mcp_dj` with the **absolute path** to this repo on your machine.
+3. Merge the `mcpServers` block into your Claude Desktop config for your OS:
+   - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+4. Restart Claude Desktop.
+
+**macOS/Linux** — entry uses bash and the project venv:
+
+```json
+"mcp-dj": {
+  "command": "/bin/bash",
+  "args": ["-c", "cd '/path/to/mcp_dj' && exec .venv/bin/python3 -m mcp_dj.mcp_server"]
+}
+```
+
+**Windows** — use `cmd` and the Windows venv path:
+
+```json
+"mcp-dj": {
+  "command": "cmd",
+  "args": ["/c", "cd /d \"C:\\path\\to\\mcp_dj\" && .venv\\Scripts\\python.exe -m mcp_dj.mcp_server"]
+}
+```
+
+Run `./install.sh` to have this entry added to your Claude Desktop config automatically.
 
 Or run the MCP server manually:
 

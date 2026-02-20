@@ -5,19 +5,11 @@
   "_instructions": "Replace /path/to/mcp_dj below with the absolute path to this repo on your machine.",
   "mcpServers": {
     "mcp-dj": {
-      "command": "uv",
+      "command": "/bin/bash",
       "args": [
-        "run",
-        "--project",
-        "/path/to/mcp_dj",
-        "python",
-        "-m",
-        "mcp_dj.mcp_server"
-      ],
-      "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-...",
-        "MIK_CSV_PATH": "/path/to/Mixed In Key Data/Library.csv"
-      }
+        "-c",
+        "cd '/path/to/mcp_dj' && exec .venv/bin/python3 -m mcp_dj.mcp_server"
+      ]
     }
   }
 }
