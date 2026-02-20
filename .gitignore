@@ -48,6 +48,11 @@ Library.csv
 # uv
 .python-version
 
+# Essentia ML models and audio analysis cache (large binaries + personal data)
+# Download models with: ./download_models.sh
+.data/models/
+.data/essentia_cache/
+
 # Logs
 *.log
 logs/

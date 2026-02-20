@@ -75,12 +75,8 @@ class EssentiaFeatures(BaseModel):
     Stored as a JSON cache entry at ~/.setlist_creator/essentia_cache/<sha256>.json
     """
 
-    # Cache metadata
-    schema_version: int = Field(1, description="Cache schema version for future migrations")
+    # Identity
     file_path: str = Field(..., description="Absolute path to the analyzed audio file")
-    analyzed_at: str = Field(..., description="ISO-8601 UTC timestamp of analysis")
-    essentia_version: Optional[str] = Field(None, description="Essentia library version used")
-    analysis_duration_seconds: float = Field(0.0, description="Time taken to analyze in seconds")
 
     # BPM / Rhythm
     bpm_essentia: float = Field(0.0, description="BPM detected by Essentia RhythmExtractor2013")
@@ -117,6 +113,69 @@ class EssentiaFeatures(BaseModel):
 
     # Music autotagging (MagnaTagATune — tags above threshold)
     music_tags: Optional[list] = Field(None, description="MagnaTagATune tags above 0.1 threshold, sorted by score e.g. [{'tag': 'techno', 'score': 0.33}]")
+
+    # Internal metadata (not written to AI-facing cache)
+    analyzed_at: str = Field("", description="ISO-8601 UTC timestamp of analysis")
+    essentia_version: Optional[str] = Field(None, description="Essentia library version used")
+    analysis_duration_seconds: float = Field(0.0, description="Time taken to analyze in seconds")
+
+    def to_cache_dict(self) -> dict:
+        """Return a compact, AI-readable dict for JSON cache storage.
+
+        - Strips internal metadata (analyzed_at, essentia_version, duration)
+        - Rounds floats to 2 decimal places
+        - Strips 'Electronic---' prefix from genre keys
+        - Flattens music_tags from [{tag, score}] to {tag: score}
+        - Adds derived energy (1-10) and danceability_score (1-10)
+        """
+        def _r(v: float | None, n: int = 2) -> float | None:
+            return round(v, n) if v is not None else None
+
+        # Strip "Electronic---" category prefix from Discogs genres
+        genre: dict | None = None
+        if self.genre_discogs:
+            genre = {
+                k.split("---", 1)[-1]: round(v, 3)
+                for k, v in self.genre_discogs.items()
+            }
+
+        # Flatten [{tag, score}] → {tag: score}
+        tags: dict | None = None
+        if self.music_tags:
+            tags = {t["tag"]: round(t["score"], 3) for t in self.music_tags}
+
+        dominant_genre = max(genre, key=lambda g: genre[g]) if genre else None
+        dominant_tag = max(tags, key=lambda t: tags[t]) if tags else None
+
+        d: dict = {
+            "file_path": self.file_path,
+            "bpm": _r(self.bpm_essentia),
+            "key": self.key_essentia,
+            "key_note": (
+                f"{self.key_name_raw} {self.key_scale}" if self.key_name_raw else None
+            ),
+            "key_strength": _r(self.key_strength),
+            "energy": self.energy_as_1_to_10(),
+            "danceability": self.danceability_as_1_to_10(),
+            "lufs": _r(self.integrated_lufs),
+            "dominant_mood": self.dominant_mood(),
+            "dominant_genre": dominant_genre,
+            "dominant_tag": dominant_tag,
+            "mood": {
+                "happy":      _r(self.mood_happy),
+                "sad":        _r(self.mood_sad),
+                "aggressive": _r(self.mood_aggressive),
+                "relaxed":    _r(self.mood_relaxed),
+                "party":      _r(self.mood_party),
+            } if any(v is not None for v in [
+                self.mood_happy, self.mood_sad, self.mood_aggressive,
+                self.mood_relaxed, self.mood_party,
+            ]) else None,
+            "genre": genre,
+            "tags": tags,
+        }
+        # Remove None values to keep the file lean
+        return {k: v for k, v in d.items() if v is not None}
 
     def energy_as_1_to_10(self) -> int:
         """Convert integrated LUFS loudness to 1-10 scale. -20 LUFS → 1, -3 LUFS → 10."""

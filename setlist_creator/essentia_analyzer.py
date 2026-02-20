@@ -5,18 +5,17 @@ Analyzes audio files for BPM accuracy, key detection, danceability,
 loudness, mood classification, genre detection, and music autotagging.
 
 Installation:
-  pip install essentia
+  pip install essentia-tensorflow
 
 Model files (download once with ./download_models.sh):
-  ~/.setlist_creator/models/
+  .data/models/          (in repo root, git-ignored)
 
-Cache location: ~/.setlist_creator/essentia_cache/<sha256_of_filepath>.json
+Cache location: .data/essentia_cache/<sha256_of_filepath>.json
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 import time
 from datetime import datetime, timezone
@@ -46,8 +45,10 @@ except ImportError:
 # Cache configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = Path.home() / ".setlist_creator" / "essentia_cache"
-MODEL_DIR = Path.home() / ".setlist_creator" / "models"
+# Both live inside the repo under .data/ (git-ignored — large binaries + personal data)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = _REPO_ROOT / ".data" / "essentia_cache"
+MODEL_DIR  = _REPO_ROOT / ".data" / "models"
 
 # ---------------------------------------------------------------------------
 # Key conversion: Essentia (standard notation) → Camelot wheel
@@ -83,37 +84,61 @@ def _essentia_key_to_camelot(key_name: str, scale: str) -> Optional[str]:
 # Cache helpers
 # ---------------------------------------------------------------------------
 
-def _cache_key(file_path: str) -> str:
-    """SHA-256 hash of the resolved absolute file path string."""
-    normalized = str(Path(file_path).resolve())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 def _cache_path(file_path: str) -> Path:
-    return CACHE_DIR / f"{_cache_key(file_path)}.json"
+    return CACHE_DIR / f"{Path(file_path).stem}.json"
 
 
 def load_cached_features(file_path: str) -> Optional[EssentiaFeatures]:
     """Load cached Essentia features without triggering analysis.
 
+    Supports the compact cache format written by _write_cache.
+
     Returns:
         EssentiaFeatures if a valid cache entry exists, else None.
     """
+    import json
     cache_file = _cache_path(file_path)
     if not cache_file.exists():
         return None
     try:
-        return EssentiaFeatures.model_validate_json(cache_file.read_text())
+        data = json.loads(cache_file.read_text())
+        # Map compact keys back to EssentiaFeatures fields
+        mood = data.get("mood") or {}
+        tags_dict = data.get("tags")
+        music_tags = (
+            [{"tag": t, "score": s} for t, s in tags_dict.items()]
+            if tags_dict else None
+        )
+        key_note = data.get("key_note", "")
+        parts = key_note.split(" ", 1) if key_note else []
+        return EssentiaFeatures(
+            file_path=data.get("file_path", file_path),
+            bpm_essentia=data.get("bpm", 0.0),
+            key_essentia=data.get("key"),
+            key_name_raw=parts[0] if parts else None,
+            key_scale=parts[1] if len(parts) > 1 else None,
+            key_strength=data.get("key_strength", 0.0),
+            danceability=data.get("danceability", 0.0),
+            integrated_lufs=data.get("lufs", 0.0),
+            mood_happy=mood.get("happy"),
+            mood_sad=mood.get("sad"),
+            mood_aggressive=mood.get("aggressive"),
+            mood_relaxed=mood.get("relaxed"),
+            mood_party=mood.get("party"),
+            genre_discogs=data.get("genre"),
+            music_tags=music_tags,
+        )
     except Exception as e:
         logger.warning(f"Failed to load essentia cache for {file_path}: {e}")
         return None
 
 
 def _write_cache(features: EssentiaFeatures, cache_file: Path) -> None:
-    """Write features JSON to disk, creating directories as needed."""
+    """Write compact AI-readable features JSON to disk."""
+    import json
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        cache_file.write_text(features.model_dump_json(indent=2))
+        cache_file.write_text(json.dumps(features.to_cache_dict(), indent=2))
         logger.debug(f"Essentia cache written: {cache_file}")
     except OSError as e:
         logger.warning(f"Failed to write essentia cache: {e}")

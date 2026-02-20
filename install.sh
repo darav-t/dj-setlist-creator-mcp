@@ -2,33 +2,42 @@
 # =============================================================================
 # DJ Setlist Creator — Install Script
 # =============================================================================
-# Installs all dependencies required to run the project:
-#   - uv (Python package manager)
-#   - Python 3.12+ (via uv)
-#   - All Python packages (via uv sync)
-#   - Essentia audio analysis library (optional, pip install essentia)
-#   - pyrekordbox Rekordbox database key (required to read your library)
+# Installs everything needed to run the project:
+#   1. uv          — Python package manager
+#   2. Python 3.12 — via uv
+#   3. Core deps   — pyrekordbox, pydantic, fastapi, anthropic, fastmcp, etc.
+#   4. Essentia    — audio analysis (essentia-tensorflow, optional but recommended)
+#   5. ML models   — mood, genre, tagging models in .data/models/ (optional)
+#   6. Rekordbox   — database key setup (pyrekordbox)
+#   7. .env        — environment config file
 #
 # Usage:
-#   chmod +x install.sh
-#   ./install.sh            # standard install
-#   ./install.sh --essentia # also install Essentia audio analysis
+#   ./install.sh                   # core only
+#   ./install.sh --essentia        # + essentia-tensorflow + ML models
+#   ./install.sh --essentia --skip-models  # + essentia but skip model download
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_ESSENTIA=false
+cd "$SCRIPT_DIR"
 
-# Parse flags
+INSTALL_ESSENTIA=false
+SKIP_MODELS=false
+
 for arg in "$@"; do
   case "$arg" in
-    --essentia) INSTALL_ESSENTIA=true ;;
+    --essentia)      INSTALL_ESSENTIA=true ;;
+    --skip-models)   SKIP_MODELS=true ;;
     --help|-h)
-      echo "Usage: ./install.sh [--essentia]"
+      echo "Usage: ./install.sh [--essentia] [--skip-models]"
       echo ""
-      echo "  --essentia   Also install the Essentia audio analysis library"
-      echo "               Enables: analyze-track, analyze_track MCP tool"
+      echo "  --essentia      Install essentia-tensorflow + download ML models"
+      echo "                  Enables: BPM, key, mood, genre, tagging analysis"
+      echo "                  Run: analyze-track /path/to/song.mp3"
+      echo ""
+      echo "  --skip-models   Install essentia-tensorflow but skip model download"
+      echo "                  Download later with: ./download_models.sh"
       exit 0
       ;;
   esac
@@ -46,29 +55,28 @@ NC='\033[0m'
 
 info()    { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
-error()   { echo -e "${RED}[✗]${NC} $*"; }
+error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
 header()  { echo -e "\n${BOLD}$*${NC}"; }
 divider() { echo "------------------------------------------------------------"; }
 
 # -----------------------------------------------------------------------------
-# 1. Check for uv
+# 1. uv
 # -----------------------------------------------------------------------------
 
 header "Step 1 — uv package manager"
 divider
 
 if command -v uv &>/dev/null; then
-  UV_VERSION=$(uv --version 2>&1 | head -1)
-  info "uv already installed: $UV_VERSION"
+  info "uv already installed: $(uv --version 2>&1 | head -1)"
 else
   warn "uv not found — installing..."
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  # Add uv to PATH for the rest of this script
   export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
   if command -v uv &>/dev/null; then
     info "uv installed: $(uv --version 2>&1 | head -1)"
   else
-    error "uv installation failed. Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+    error "uv installation failed."
+    error "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
     exit 1
   fi
 fi
@@ -80,10 +88,7 @@ fi
 header "Step 2 — Python 3.12+"
 divider
 
-cd "$SCRIPT_DIR"
-
 if uv python find 3.12 &>/dev/null 2>&1; then
-  PY_VERSION=$(uv python find 3.12 2>/dev/null | xargs python3 --version 2>/dev/null || echo "3.12.x")
   info "Python 3.12+ available"
 else
   warn "Python 3.12 not found — installing via uv..."
@@ -95,42 +100,127 @@ fi
 # 3. Core Python dependencies
 # -----------------------------------------------------------------------------
 
-header "Step 3 — Python packages (uv sync)"
+header "Step 3 — Core Python packages"
 divider
 
-echo "Installing: pyrekordbox, pydantic, fastapi, uvicorn, loguru, anthropic, fastmcp"
+echo "  pyrekordbox  — Rekordbox database access"
+echo "  pydantic     — data models"
+echo "  fastapi      — web server"
+echo "  uvicorn      — ASGI server"
+echo "  loguru       — logging"
+echo "  anthropic    — Claude API"
+echo "  fastmcp      — MCP server for Claude Desktop"
+echo ""
+
 uv sync
 info "Core packages installed"
 
 # -----------------------------------------------------------------------------
-# 4. Essentia (optional)
+# 4. Essentia (optional — recommended for audio analysis)
 # -----------------------------------------------------------------------------
 
-header "Step 4 — Essentia audio analysis (optional)"
+header "Step 4 — Essentia audio analysis"
 divider
 
 if [ "$INSTALL_ESSENTIA" = true ]; then
-  echo "Installing Essentia..."
-  if uv pip install essentia; then
-    info "Essentia installed"
-    echo "  You can now run: python -m setlist_creator.analyze_track /path/to/song.mp3"
+  echo "Installing essentia-tensorflow..."
+  echo "  Package size: ~135 MB"
+  echo ""
+
+  if uv sync --extra essentia; then
+    info "essentia-tensorflow installed"
   else
-    warn "Essentia installation failed."
-    warn "Try manually: pip install essentia"
-    warn "See: https://github.com/MTG/essentia"
+    # Fallback: add it directly if --extra sync fails
+    warn "uv sync --extra failed, trying uv add..."
+    if uv add essentia-tensorflow; then
+      info "essentia-tensorflow installed"
+    else
+      error "essentia-tensorflow installation failed."
+      warn "Try manually: uv add essentia-tensorflow"
+      INSTALL_ESSENTIA=false
+    fi
   fi
 else
-  warn "Skipping Essentia (run with --essentia to include it)"
-  echo "  Essentia enables audio feature extraction: BPM accuracy, key detection,"
-  echo "  danceability scoring, and loudness analysis."
-  echo "  To install later: pip install essentia"
+  echo "  Essentia analyzes your songs to extract:"
+  echo "    • Accurate BPM + beat confidence"
+  echo "    • Key detection (Camelot wheel)"
+  echo "    • Danceability scoring"
+  echo "    • EBU R128 loudness (LUFS + RMS dB)"
+  echo "    • Mood classification (happy/sad/aggressive/relaxed/party)"
+  echo "    • Genre detection (Discogs400 — 400 styles)"
+  echo "    • Music autotagging (techno, beat, electronic, etc.)"
+  echo ""
+  echo "  Package size: ~135 MB + ~300 MB ML models"
+  echo ""
+  read -r -p "  Install Essentia for song analysis? [y/N] " REPLY
+  REPLY="${REPLY:-N}"
+  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    INSTALL_ESSENTIA=true
+    echo ""
+    echo "Installing essentia-tensorflow..."
+    echo ""
+    if uv sync --extra essentia; then
+      info "essentia-tensorflow installed"
+    else
+      warn "uv sync --extra failed, trying uv add..."
+      if uv add essentia-tensorflow; then
+        info "essentia-tensorflow installed"
+      else
+        error "essentia-tensorflow installation failed."
+        warn "Try manually: uv add essentia-tensorflow"
+        INSTALL_ESSENTIA=false
+      fi
+    fi
+  else
+    warn "Skipping Essentia — install later with: ./install.sh --essentia"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Rekordbox database key (pyrekordbox setup)
+# 5. ML model files (only if essentia was installed)
 # -----------------------------------------------------------------------------
 
-header "Step 5 — Rekordbox database access"
+header "Step 5 — Essentia ML models"
+divider
+
+MODEL_DIR="$SCRIPT_DIR/.data/models"
+
+if [ "$INSTALL_ESSENTIA" = true ]; then
+  if [ "$SKIP_MODELS" = true ]; then
+    warn "Skipping model download (--skip-models)"
+    echo "  Download later: ./download_models.sh"
+  else
+    # Count already-downloaded models
+    EXISTING=0
+    if [ -d "$MODEL_DIR" ]; then
+      EXISTING=$(find "$MODEL_DIR" -name "*.pb" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    if [ "$EXISTING" -ge 20 ]; then
+      info "All ML models already present ($EXISTING .pb files in .data/models/)"
+    else
+      echo "Downloading ML models to .data/models/ (git-ignored)..."
+      echo "  Models: VGGish, EffNet, mood (×5), genre Discogs400, MagnaTagATune tags"
+      echo "  Total size: ~300 MB"
+      echo ""
+      if bash "$SCRIPT_DIR/download_models.sh"; then
+        info "ML models downloaded"
+      else
+        warn "Some models failed to download."
+        warn "Re-run later: ./download_models.sh"
+      fi
+    fi
+  fi
+else
+  warn "Skipping ML models (Essentia not installed)"
+  echo "  Download later after installing Essentia: ./download_models.sh"
+fi
+
+# -----------------------------------------------------------------------------
+# 6. Rekordbox database key
+# -----------------------------------------------------------------------------
+
+header "Step 6 — Rekordbox database access"
 divider
 
 echo "Checking pyrekordbox configuration..."
@@ -139,33 +229,30 @@ if uv run python -c "import pyrekordbox; pyrekordbox.show_config()" 2>/dev/null 
   info "pyrekordbox already configured"
 else
   echo ""
-  echo "pyrekordbox needs the Rekordbox master.db key to decrypt your library."
-  echo "Run the following command to set it up:"
+  echo "  pyrekordbox needs the Rekordbox master.db decryption key."
+  echo "  This is read automatically from your Rekordbox installation."
+  echo "  Rekordbox must be installed on this machine."
   echo ""
-  echo -e "  ${BOLD}uv run python -m pyrekordbox setup-db${NC}"
-  echo ""
-  echo "This reads the key from your Rekordbox installation automatically."
-  echo "Rekordbox must be installed on this machine."
-  echo ""
-  read -r -p "Run pyrekordbox setup now? [Y/n] " REPLY
+  read -r -p "  Run pyrekordbox setup now? [Y/n] " REPLY
   REPLY="${REPLY:-Y}"
   if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     if uv run python -m pyrekordbox setup-db; then
       info "Rekordbox database key configured"
     else
-      warn "Setup failed — you may need to run it manually after installing Rekordbox."
-      warn "Command: uv run python -m pyrekordbox setup-db"
+      warn "Setup failed — run manually once Rekordbox is installed:"
+      warn "  uv run python -m pyrekordbox setup-db"
     fi
   else
-    warn "Skipped — run 'uv run python -m pyrekordbox setup-db' before starting the server."
+    warn "Skipped — run before starting the server:"
+    warn "  uv run python -m pyrekordbox setup-db"
   fi
 fi
 
 # -----------------------------------------------------------------------------
-# 6. Environment file
+# 7. .env file
 # -----------------------------------------------------------------------------
 
-header "Step 6 — Environment configuration"
+header "Step 7 — Environment configuration"
 divider
 
 ENV_FILE="$SCRIPT_DIR/.env"
@@ -195,8 +282,44 @@ EOF
     info ".env created"
   fi
   echo ""
-  warn "Add your Anthropic API key to .env to enable AI chat:"
+  warn "Add your Anthropic API key to .env:"
   echo "  ANTHROPIC_API_KEY=sk-ant-..."
+fi
+
+# -----------------------------------------------------------------------------
+# 8. .data/ directory
+# -----------------------------------------------------------------------------
+
+mkdir -p "$SCRIPT_DIR/.data/models" "$SCRIPT_DIR/.data/essentia_cache"
+
+# -----------------------------------------------------------------------------
+# 9. Analyze Rekordbox library (only if essentia was installed)
+# -----------------------------------------------------------------------------
+
+if [ "$INSTALL_ESSENTIA" = true ]; then
+  header "Step 9 — Analyze Rekordbox library"
+  divider
+  echo "  Essentia can now analyze every song in your Rekordbox library."
+  echo "  This extracts BPM, key, mood, genre, and tags for all your tracks,"
+  echo "  making AI setlist recommendations much more accurate."
+  echo ""
+  echo "  Analysis runs in parallel across multiple CPU cores."
+  echo "  Depending on library size this may take a while (~10-15s per track)."
+  echo "  You can stop it any time with Ctrl+C and resume later."
+  echo ""
+  read -r -p "  Analyze your Rekordbox library now? [y/N] " REPLY
+  REPLY="${REPLY:-N}"
+  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    # Suggest a worker count based on CPU cores
+    CPU_COUNT=$(python3 -c "import os; print(max(1, min(4, (os.cpu_count() or 2) // 2)))" 2>/dev/null || echo "2")
+    echo ""
+    read -r -p "  Parallel workers? (default: $CPU_COUNT, recommended for your machine) " WORKERS
+    WORKERS="${WORKERS:-$CPU_COUNT}"
+    echo ""
+    bash "$SCRIPT_DIR/analyze-library.sh" --workers "$WORKERS"
+  else
+    warn "Skipping — run later with: ./analyze-library.sh"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -204,29 +327,48 @@ fi
 # -----------------------------------------------------------------------------
 
 echo ""
+echo ""
 divider
 echo -e "${BOLD}Installation complete!${NC}"
 divider
 echo ""
-echo "Next steps:"
-echo ""
-echo "  1. Add your API key to .env:"
+
+MCP_NAME=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$SCRIPT_DIR/claude_desktop_config.json'))
+    k = list(d.get('mcpServers', {}).keys())
+    print(k[0] if k else 'dj-setlist-creator')
+except:
+    print('dj-setlist-creator')
+" 2>/dev/null || echo "dj-setlist-creator")
+
+echo "  1. Add your Anthropic API key to .env:"
 echo "       ANTHROPIC_API_KEY=sk-ant-..."
 echo ""
 echo "  2. Start the web UI:"
 echo "       ./run-server.sh"
 echo "       Open: http://localhost:8888"
 echo ""
-echo "  3. Or connect to Claude Desktop — add to claude_desktop_config.json:"
-echo "       $(cat "$SCRIPT_DIR/claude_desktop_config.json" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); k=list(d.get('mcpServers',{}).keys()); print(k[0] if k else 'see claude_desktop_config.json')" 2>/dev/null || echo "see claude_desktop_config.json")"
+echo "  3. Connect to Claude Desktop (add to claude_desktop_config.json):"
+echo "       Server name: $MCP_NAME"
+echo "       See: claude_desktop_config.json"
 echo ""
+
 if [ "$INSTALL_ESSENTIA" = true ]; then
-echo "  4. Analyze a track with Essentia:"
-echo "       python -m setlist_creator.analyze_track /path/to/song.mp3"
-echo ""
+  echo "  4. Analyze a track (BPM, key, mood, genre, tags):"
+  echo "       analyze-track /path/to/song.mp3"
+  echo "       analyze-track /path/to/song.mp3 --output json"
+  echo ""
+  if [ "$SKIP_MODELS" = true ]; then
+    echo "  5. Download ML models when ready:"
+    echo "       ./download_models.sh"
+    echo ""
+  fi
 else
-echo "  4. To enable audio analysis (optional):"
-echo "       ./install.sh --essentia"
-echo ""
+  echo "  4. Enable audio analysis (optional, ~135 MB + ~300 MB models):"
+  echo "       ./install.sh --essentia"
+  echo ""
 fi
+
 divider

@@ -7,8 +7,8 @@
 #   - Music autotagging: MagnaTagATune tags (techno, dance, beat, etc.)
 #   - Genre classification: Discogs400 (House, Techno, etc.)
 #
-# Models are stored at: ~/.setlist_creator/models/
-# Total download size: ~250 MB
+# Models are stored at: .data/models/ (git-ignored, relative to repo root)
+# Total download size: ~300 MB
 #
 # Usage:
 #   chmod +x download_models.sh
@@ -17,7 +17,8 @@
 
 set -euo pipefail
 
-MODEL_DIR="${HOME}/.setlist_creator/models"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODEL_DIR="${SCRIPT_DIR}/.data/models"
 BASE_URL="https://essentia.upf.edu/models"
 
 GREEN='\033[0;32m'
@@ -120,6 +121,7 @@ echo ""
 TOTAL=$(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1)
 echo "  Total size: $TOTAL"
 echo ""
-echo "Models are ready. Run 'analyze-track' to use them:"
+echo "Models are ready (stored in .data/models/ — git-ignored)."
+echo "Run 'analyze-track' to use them:"
 echo "  analyze-track /path/to/song.mp3"
 echo ""
