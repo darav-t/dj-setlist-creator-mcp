@@ -9,7 +9,7 @@ To connect to Claude Desktop, add to claude_desktop_config.json:
   "mcpServers": {
     "dj-setlist-creator": {
       "command": "uv",
-      "args": ["run", "--project", "/path/to/set_list_creator", "python", "-m", "setlist_creator.mcp_server"],
+      "args": ["run", "--project", "/path/to/set_list_creator", "python", "-m", "mcp_dj.mcp_server"],
       "env": {}
     }
   }
@@ -32,6 +32,22 @@ from .camelot import CamelotWheel
 from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
 from .models import SetlistRequest
+
+# Optional Essentia integration — gracefully unavailable if not installed
+try:
+    from .essentia_analyzer import (
+        analyze_file as _essentia_analyze_file,
+        analyze_library as _essentia_analyze_library,
+        EssentiaFeatureStore,
+        ESSENTIA_AVAILABLE,
+        CACHE_DIR as ESSENTIA_CACHE_DIR,
+    )
+except ImportError:
+    ESSENTIA_AVAILABLE = False
+    _essentia_analyze_file = None
+    _essentia_analyze_library = None
+    EssentiaFeatureStore = None
+    ESSENTIA_CACHE_DIR = None
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -63,10 +79,17 @@ async def _ensure_initialized():
     all_tracks = await db.get_all_tracks()
     resolver.resolve_all(all_tracks)
 
+    # Load Essentia cache into memory for use during scoring (no analysis triggered)
+    essentia_store = None
+    if EssentiaFeatureStore is not None:
+        essentia_store = EssentiaFeatureStore(all_tracks)
+        logger.info(f"Essentia cache: {len(essentia_store)} tracks loaded")
+
     engine = SetlistEngine(
         tracks=all_tracks,
         camelot=CamelotWheel(),
         energy_planner=EnergyPlanner(),
+        essentia_store=essentia_store,
     )
     _initialized = True
     logger.info(f"MCP server ready with {len(all_tracks)} tracks")
@@ -126,6 +149,23 @@ async def generate_setlist(
 
     setlist = engine.generate_setlist(request)
 
+    # Build per-track essentia enrichment if store is available
+    essentia_store = engine.essentia_store
+
+    def _essentia_snippet(file_path):
+        if not essentia_store:
+            return {}
+        ess = essentia_store.get(file_path)
+        if not ess:
+            return {}
+        return {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "dominant_mood": ess.dominant_mood(),
+            "top_genre_discogs": ess.top_genre(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+
     return {
         "setlist_id": setlist.id,
         "name": setlist.name,
@@ -136,6 +176,9 @@ async def generate_setlist(
         "harmonic_score": setlist.harmonic_score,
         "energy_arc": setlist.energy_arc,
         "genre_distribution": setlist.genre_distribution,
+        "essentia_cache_coverage": (
+            f"{len(essentia_store)} tracks with audio analysis" if essentia_store else "no essentia cache"
+        ),
         "tracks": [
             {
                 "position": st.position,
@@ -150,6 +193,7 @@ async def generate_setlist(
                 "key_relation": st.key_relation,
                 "transition_score": st.transition_score,
                 "notes": st.notes,
+                **_essentia_snippet(st.track.file_path),
             }
             for st in setlist.tracks
         ],
@@ -187,6 +231,22 @@ async def recommend_next_track(
     if not recs:
         return [{"error": f"Track '{current_track_title}' not found in library"}]
 
+    essentia_store = engine.essentia_store
+
+    def _ess_fields(file_path):
+        if not essentia_store:
+            return {}
+        ess = essentia_store.get(file_path)
+        if not ess:
+            return {}
+        return {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "dominant_mood": ess.dominant_mood(),
+            "top_genre_discogs": ess.top_genre(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+
     return [
         {
             "rank": i + 1,
@@ -204,6 +264,7 @@ async def recommend_next_track(
             "bpm_score": r.bpm_score,
             "genre_score": r.genre_score,
             "reason": r.reason,
+            **_ess_fields(r.track.file_path),
         }
         for i, r in enumerate(recs)
     ]
@@ -384,7 +445,8 @@ async def get_compatible_tracks(
             continue
 
         _, rel = camelot.transition_score(key, track.key)
-        results.append({
+
+        entry = {
             "artist": track.artist,
             "title": track.title,
             "bpm": track.bpm,
@@ -395,7 +457,19 @@ async def get_compatible_tracks(
             "file_path": track.file_path,
             "harmonic_score": h_score,
             "key_relationship": rel,
-        })
+        }
+
+        # Enrich with essentia cache data when available
+        if engine.essentia_store:
+            ess = engine.essentia_store.get(track.file_path)
+            if ess:
+                entry["essentia_energy"] = ess.energy_as_1_to_10()
+                entry["danceability"] = ess.danceability_as_1_to_10()
+                entry["dominant_mood"] = ess.dominant_mood()
+                entry["top_genre_discogs"] = ess.top_genre()
+                entry["lufs"] = round(ess.integrated_lufs, 1)
+
+        results.append(entry)
 
     results.sort(key=lambda x: (-x["harmonic_score"], -x["rating"]))
     return results[:limit]
@@ -1085,6 +1159,153 @@ async def get_db_agent_registry(limit: int = 100, offset: int = 0) -> List[Dict[
     """
     await _ensure_initialized()
     return await db.query_agent_registry(limit=limit, offset=offset)
+
+
+# ---------------------------------------------------------------------------
+# Essentia audio analysis tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def analyze_track(
+    file_path: str,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Analyze a single audio file with Essentia to extract BPM, key, danceability,
+    loudness, mood scores, genre classification, and music tags. Results are cached
+    at .data/essentia_cache/ so the same file is never analyzed twice.
+
+    ML features (mood, genre, tags) require model files — download once with:
+      ./download_models.sh
+
+    Args:
+        file_path: Absolute path to an audio file (.mp3, .wav, .flac, .aiff, .m4a)
+        force: If True, re-analyze even if a cached result already exists
+
+    Returns:
+        Analysis results including BPM, Camelot key, danceability, EBU R128
+        loudness (LUFS + RMS dBFS), mood probabilities, Discogs400 genre scores,
+        and MagnaTagATune music tags.
+    """
+    if not ESSENTIA_AVAILABLE:
+        return {
+            "error": "Essentia is not installed",
+            "install_instructions": {
+                "install": "pip install essentia",
+            },
+        }
+
+    try:
+        features = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _essentia_analyze_file(file_path, force=force)
+        )
+    except FileNotFoundError:
+        return {"error": f"Audio file not found: {file_path}"}
+    except Exception as e:
+        logger.error(f"Essentia analysis failed for {file_path}: {e}")
+        return {"error": f"Analysis failed: {str(e)}"}
+
+    return {
+        "file_path": features.file_path,
+        "analyzed_at": features.analyzed_at,
+        "essentia_version": features.essentia_version,
+        "analysis_seconds": features.analysis_duration_seconds,
+        "bpm": {
+            "value": round(features.bpm_essentia, 2),
+            "confidence": round(features.bpm_confidence, 3),
+            "beats_count": features.beats_count,
+        },
+        "key": {
+            "camelot": features.key_essentia,
+            "raw": f"{features.key_name_raw} {features.key_scale}" if features.key_name_raw else None,
+            "strength": round(features.key_strength, 3),
+        },
+        "danceability": {
+            "score": round(features.danceability, 3),
+            "scale_1_to_10": features.danceability_as_1_to_10(),
+        },
+        "loudness": {
+            "integrated_lufs": round(features.integrated_lufs, 2),
+            "loudness_range_db": round(features.loudness_range_db, 2),
+            "rms_db": round(features.rms_db, 2),
+            "rms_linear": round(features.rms_energy, 5),
+            "scale_1_to_10": features.energy_as_1_to_10(),
+        },
+        "mood": {
+            "happy":      round(features.mood_happy, 3)      if features.mood_happy      is not None else None,
+            "sad":        round(features.mood_sad, 3)        if features.mood_sad        is not None else None,
+            "aggressive": round(features.mood_aggressive, 3) if features.mood_aggressive is not None else None,
+            "relaxed":    round(features.mood_relaxed, 3)    if features.mood_relaxed    is not None else None,
+            "party":      round(features.mood_party, 3)      if features.mood_party      is not None else None,
+            "dominant":   features.dominant_mood(),
+        },
+        "genre_discogs": features.genre_discogs,
+        "music_tags": features.music_tags,
+        "cache_directory": str(ESSENTIA_CACHE_DIR),
+    }
+
+
+@mcp.tool()
+async def analyze_library_essentia(
+    force: bool = False,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Batch-analyze all tracks in the loaded Rekordbox library that have an audio
+    file path using Essentia. Results are cached to disk; already-analyzed tracks
+    are skipped unless force=True.
+
+    This operation is CPU-intensive and may take several minutes for large libraries.
+    Run it once upfront; subsequent setlist generation can use the cached features.
+
+    Args:
+        force: Re-analyze tracks even if cached results exist (default: False)
+        limit: Maximum number of tracks to analyze in this run. Useful for
+               incremental analysis. None means process all tracks with a file path.
+
+    Returns:
+        Summary with counts of analyzed, cached, skipped, and errored tracks,
+        plus the cache directory location.
+    """
+    await _ensure_initialized()
+
+    if not ESSENTIA_AVAILABLE:
+        return {
+            "error": "Essentia is not installed",
+            "install_instructions": {
+                "install": "pip install essentia",
+            },
+        }
+
+    tracks_to_process = engine.tracks
+    if limit is not None:
+        tracks_to_process = tracks_to_process[:limit]
+
+    total_in_library = len(engine.tracks)
+    logger.info(f"Starting Essentia library analysis: {len(tracks_to_process)} tracks")
+
+    stats = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _essentia_analyze_library(
+            tracks=tracks_to_process,
+            force=force,
+            skip_missing=True,
+        ),
+    )
+
+    return {
+        "total_tracks_in_library": total_in_library,
+        "tracks_processed": len(tracks_to_process),
+        "analyzed_new": stats["analyzed"],
+        "loaded_from_cache": stats["cached"],
+        "skipped_no_file_path": stats["skipped_no_path"],
+        "skipped_missing_file": stats["skipped_missing_file"],
+        "errors": stats["errors"],
+        "cache_directory": str(ESSENTIA_CACHE_DIR),
+        "message": (
+            f"Analysis complete. {stats['analyzed']} new tracks analyzed, "
+            f"{stats['cached']} loaded from cache, "
+            f"{stats['errors']} errors."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
