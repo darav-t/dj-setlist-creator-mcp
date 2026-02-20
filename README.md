@@ -2,6 +2,9 @@
 
 AI-powered DJ setlist generator with harmonic mixing and energy arc planning, built on your local Rekordbox library.
 
+> [!NOTE]
+> AI can't replace human emotions, feelings and vibes on dancefloor however it can help you elevate it, use wisely ;)
+
 ---
 
 ## Features
