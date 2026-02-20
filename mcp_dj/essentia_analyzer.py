@@ -16,6 +16,10 @@ Cache location: .data/essentia_cache/<sha256_of_filepath>.json
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import json
+import multiprocessing
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -33,12 +37,14 @@ from .models import EssentiaFeatures
 try:
     import essentia
     import essentia.standard as es
+    import numpy as np
 
     ESSENTIA_AVAILABLE = True
     ESSENTIA_VERSION: Optional[str] = essentia.__version__
 except ImportError:
     ESSENTIA_AVAILABLE = False
     ESSENTIA_VERSION = None
+    np = None  # type: ignore[assignment]
     logger.debug("Essentia not installed — audio analysis unavailable (optional feature)")
 
 # ---------------------------------------------------------------------------
@@ -96,7 +102,6 @@ def load_cached_features(file_path: str) -> Optional[EssentiaFeatures]:
     Returns:
         EssentiaFeatures if a valid cache entry exists, else None.
     """
-    import json
     cache_file = _cache_path(file_path)
     if not cache_file.exists():
         return None
@@ -135,7 +140,6 @@ def load_cached_features(file_path: str) -> Optional[EssentiaFeatures]:
 
 def _write_cache(features: EssentiaFeatures, cache_file: Path) -> None:
     """Write compact AI-readable features JSON to disk."""
-    import json
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         cache_file.write_text(json.dumps(features.to_cache_dict(), indent=2))
@@ -176,7 +180,6 @@ def _run_analysis(file_path: str) -> EssentiaFeatures:
     integrated_lufs = 0.0
     loudness_range = 0.0
     try:
-        import numpy as np
         stereo_audio = np.column_stack([audio, audio])
         loudness_algo = es.LoudnessEBUR128(sampleRate=44100)
         _momentary, _short_term, integrated_lufs, loudness_range = loudness_algo(stereo_audio)
@@ -192,7 +195,6 @@ def _run_analysis(file_path: str) -> EssentiaFeatures:
 
     # 5. RMS Energy (linear) + RMS in dBFS
     try:
-        import numpy as np
         rms_linear = float(np.sqrt(np.mean(audio ** 2)))
         rms_db = float(20.0 * np.log10(max(rms_linear, 1e-10)))
     except Exception as e:
@@ -238,8 +240,6 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
     Gracefully skips any model whose files aren't downloaded.
     Returns the features object updated in-place.
     """
-    import numpy as np
-
     # Load audio at 16kHz (required by all ML models)
     try:
         audio_16k = es.MonoLoader(filename=file_path, sampleRate=16000, resampleQuality=4)()
@@ -326,9 +326,8 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if effnet_embeddings is not None and tagging_pb and tagging_json:
         try:
-            import json as _json
             with open(tagging_json) as f:
-                tag_meta = _json.load(f)
+                tag_meta = json.load(f)
             tag_classes = tag_meta.get("classes", [])
 
             tag_classifier = es.TensorflowPredict2D(
@@ -361,9 +360,8 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if effnet_embeddings is not None and genre_pb and genre_json:
         try:
-            import json as _json
             with open(genre_json) as f:
-                genre_meta = _json.load(f)
+                genre_meta = json.load(f)
             genre_classes = genre_meta.get("classes", [])
 
             genre_classifier = es.TensorflowPredict2D(
@@ -417,15 +415,12 @@ def analyze_file(file_path: str, force: bool = False) -> EssentiaFeatures:
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {file_path}")
 
-    # Check cache first
-    cache_file = _cache_path(str(path))
-    if not force and cache_file.exists():
-        try:
-            cached = EssentiaFeatures.model_validate_json(cache_file.read_text())
+    # Check cache first (use load_cached_features to correctly parse compact format)
+    if not force:
+        cached = load_cached_features(str(path))
+        if cached is not None:
             logger.debug(f"Loaded from cache: {file_path}")
             return cached
-        except Exception as e:
-            logger.warning(f"Cache read failed for {file_path}, re-analyzing: {e}")
 
     # Run signal analysis
     t0 = time.monotonic()
@@ -443,7 +438,7 @@ def analyze_file(file_path: str, force: bool = False) -> EssentiaFeatures:
         f"mood={features.dominant_mood() or 'n/a'} genre={features.top_genre() or 'n/a'}"
     )
 
-    _write_cache(features, cache_file)
+    _write_cache(features, _cache_path(str(path)))
     return features
 
 
@@ -451,10 +446,31 @@ def analyze_file(file_path: str, force: bool = False) -> EssentiaFeatures:
 # Batch analysis
 # ---------------------------------------------------------------------------
 
+def _analyze_file_task(file_path: str, force: bool) -> tuple[str, str, str]:
+    """Top-level worker function for ProcessPoolExecutor (must be picklable).
+
+    Returns:
+        (file_path, status, error_msg) where status is 'ok', 'missing', or 'error'.
+    """
+    try:
+        analyze_file(file_path, force=force)
+        return (file_path, "ok", "")
+    except FileNotFoundError:
+        return (file_path, "missing", "")
+    except Exception as e:
+        return (file_path, "error", str(e))
+
+
+def _default_worker_count() -> int:
+    cpus = os.cpu_count() or 2
+    return max(1, min(4, cpus // 2))
+
+
 def analyze_library(
     tracks: list,
     force: bool = False,
     skip_missing: bool = True,
+    workers: Optional[int] = None,
 ) -> dict[str, Any]:
     """Batch-analyze all tracks that have a file_path.
 
@@ -462,6 +478,8 @@ def analyze_library(
         tracks: List of Track or TrackWithEnergy objects.
         force: Re-analyze even if cached results exist.
         skip_missing: Log a warning for missing files instead of raising.
+        workers: Parallel worker processes. None = auto (cpu_count // 2, max 4).
+                 Set to 1 to disable parallelism.
 
     Returns:
         Dict with keys: analyzed, cached, skipped_no_path, skipped_missing_file,
@@ -477,6 +495,9 @@ def analyze_library(
         "results": results,
     }
 
+    # First pass: load cached tracks and collect work items
+    to_analyze: list[tuple[str, str]] = []  # (track_id, file_path)
+
     for track in tracks:
         fp = getattr(track, "file_path", None)
         if not fp:
@@ -484,10 +505,9 @@ def analyze_library(
             continue
 
         # Check cache without running analysis
-        cache_file = _cache_path(fp)
-        if not force and cache_file.exists():
+        if not force:
             cached = load_cached_features(fp)
-            if cached:
+            if cached is not None:
                 results[track.id] = cached
                 stats["cached"] += 1
                 continue
@@ -500,13 +520,56 @@ def analyze_library(
             else:
                 raise FileNotFoundError(fp)
 
-        try:
-            features = analyze_file(fp, force=force)
-            results[track.id] = features
-            stats["analyzed"] += 1
-        except Exception as e:
-            logger.error(f"Analysis failed for {fp}: {e}")
-            stats["errors"] += 1
+        to_analyze.append((track.id, fp))
+
+    if not to_analyze:
+        return stats
+
+    # Determine worker count
+    num_workers = workers if workers is not None else _default_worker_count()
+    num_workers = max(1, min(num_workers, len(to_analyze)))
+
+    if num_workers == 1:
+        # Serial path
+        for track_id, fp in to_analyze:
+            try:
+                features = analyze_file(fp, force=force)
+                results[track_id] = features
+                stats["analyzed"] += 1
+            except Exception as e:
+                logger.error(f"Analysis failed for {fp}: {e}")
+                stats["errors"] += 1
+    else:
+        # Parallel path — each worker process has its own TF/Essentia session
+        logger.info(
+            f"Parallel analysis: {num_workers} workers, {len(to_analyze)} tracks"
+        )
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers, mp_context=ctx
+        ) as executor:
+            future_to_track: dict = {
+                executor.submit(_analyze_file_task, fp, force): (track_id, fp)
+                for track_id, fp in to_analyze
+            }
+            for future in concurrent.futures.as_completed(future_to_track):
+                track_id, fp = future_to_track[future]
+                try:
+                    _, status, error_msg = future.result()
+                    if status == "ok":
+                        # Result was written to cache; load it for the results dict
+                        cached = load_cached_features(fp)
+                        if cached is not None:
+                            results[track_id] = cached
+                        stats["analyzed"] += 1
+                    elif status == "missing":
+                        stats["skipped_missing_file"] += 1
+                    else:
+                        logger.error(f"Analysis failed for {fp}: {error_msg}")
+                        stats["errors"] += 1
+                except Exception as e:
+                    logger.error(f"Worker exception for {fp}: {e}")
+                    stats["errors"] += 1
 
     return stats
 
@@ -528,15 +591,20 @@ class EssentiaFeatureStore:
 
     def __init__(self, tracks: list) -> None:
         self._store: dict[str, EssentiaFeatures] = {}
-        loaded = 0
-        for track in tracks:
-            fp = getattr(track, "file_path", None)
-            if fp:
-                cached = load_cached_features(fp)
-                if cached:
+
+        fps = [fp for t in tracks if (fp := getattr(t, "file_path", None))]
+        if not fps:
+            logger.debug("EssentiaFeatureStore: no tracks with file paths")
+            return
+
+        # Parallel I/O: read cache JSON files concurrently with threads
+        max_io_workers = min(16, len(fps))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_io_workers) as executor:
+            for fp, cached in zip(fps, executor.map(load_cached_features, fps)):
+                if cached is not None:
                     self._store[fp] = cached
-                    loaded += 1
-        logger.debug(f"EssentiaFeatureStore: loaded {loaded} cached entries")
+
+        logger.debug(f"EssentiaFeatureStore: loaded {len(self._store)} cached entries")
 
     def get(self, file_path: Optional[str]) -> Optional[EssentiaFeatures]:
         """Return cached features for a file path, or None."""

@@ -31,6 +31,7 @@ from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
 from .ai_integration import SetlistAI
 from .models import SetlistRequest
+from .library_index import LibraryIndex
 
 # ---------------------------------------------------------------------------
 # Singletons
@@ -42,6 +43,8 @@ camelot = CamelotWheel()
 planner = EnergyPlanner()
 engine = SetlistEngine(camelot=camelot, energy_planner=planner)
 ai: Optional[SetlistAI] = None
+library_index: Optional[LibraryIndex] = None
+_mik_library_app: Optional[MixedInKeyLibrary] = None
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -52,7 +55,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    global ai, energy_resolver
+    global ai, energy_resolver, library_index, _mik_library_app
 
     # Startup
     await db.connect()
@@ -61,6 +64,7 @@ async def lifespan(app_instance: FastAPI):
     mik = MixedInKeyLibrary.from_env()
     if mik is not None:
         mik.load()
+    _mik_library_app = mik
     energy_resolver = EnergyResolver(mik)
 
     # Load all tracks and resolve energy
@@ -69,6 +73,29 @@ async def lifespan(app_instance: FastAPI):
 
     # Initialize engine
     engine.initialize(all_tracks)
+
+    # Build the centralized library index (merged JSONL for LLM grep + vector search)
+    essentia_store_app = None
+    try:
+        from .essentia_analyzer import EssentiaFeatureStore
+        essentia_store_app = EssentiaFeatureStore(all_tracks)
+    except ImportError:
+        pass
+
+    library_index = LibraryIndex()
+    if library_index.is_fresh(max_age_seconds=3600):
+        count = library_index.load_from_disk()
+        logger.info(f"Library index loaded from disk: {count} records")
+    else:
+        stats = library_index.build(
+            tracks=all_tracks,
+            essentia_store=essentia_store_app,
+            mik_library=mik,
+        )
+        logger.info(
+            f"Library index built: {stats['total']} tracks "
+            f"({stats['with_essentia']} with Essentia, {stats['with_mik']} with MIK)"
+        )
 
     # Initialize AI
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -136,6 +163,43 @@ async def library_tracks(search: Optional[str] = None, limit: int = 100):
         }
         for t in tracks
     ])
+
+
+@app.post("/api/library/rebuild-index")
+async def rebuild_library_index_endpoint(force: bool = False):
+    """Rebuild the centralized JSONL library index on demand.
+
+    Query params:
+        force: If true, rebuild even if the index is fresh (< 1 hour old).
+    """
+    import asyncio as _asyncio
+
+    if library_index is None:
+        raise HTTPException(status_code=503, detail="Library index not initialized")
+
+    if not force and library_index.is_fresh(max_age_seconds=3600):
+        return JSONResponse({
+            "skipped": True,
+            "reason": "Index is fresh (< 1 hour old). Use ?force=true to rebuild.",
+            "index_path": str(library_index._record_path),
+        })
+
+    essentia_store_rebuild = None
+    try:
+        from .essentia_analyzer import EssentiaFeatureStore
+        essentia_store_rebuild = EssentiaFeatureStore(engine.tracks)
+    except ImportError:
+        pass
+
+    stats = await _asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: library_index.build(
+            tracks=engine.tracks,
+            essentia_store=essentia_store_rebuild,
+            mik_library=_mik_library_app,
+        ),
+    )
+    return JSONResponse(stats)
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from .camelot import CamelotWheel
 from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
 from .models import SetlistRequest
+from .library_index import LibraryIndex
 
 # Optional Essentia integration — gracefully unavailable if not installed
 try:
@@ -62,12 +63,14 @@ mcp = FastMCP("MCP DJ")
 
 db: Optional[RekordboxDatabase] = None
 engine: Optional[SetlistEngine] = None
+library_index: Optional[LibraryIndex] = None
+_mik_library: Optional[MixedInKeyLibrary] = None
 _initialized = False
 
 
 async def _ensure_initialized():
     """Lazy-initialize the database and engine on first tool call."""
-    global db, engine, _initialized
+    global db, engine, library_index, _mik_library, _initialized
     if _initialized:
         return
 
@@ -79,6 +82,7 @@ async def _ensure_initialized():
     mik = MixedInKeyLibrary.from_env()
     if mik is not None:
         mik.load()
+    _mik_library = mik
     resolver = EnergyResolver(mik)
 
     all_tracks = await db.get_all_tracks()
@@ -96,6 +100,23 @@ async def _ensure_initialized():
         energy_planner=EnergyPlanner(),
         essentia_store=essentia_store,
     )
+
+    # Build the centralized library index (merged JSONL for LLM grep + vector search)
+    library_index = LibraryIndex()
+    if library_index.is_fresh(max_age_seconds=3600):
+        count = library_index.load_from_disk()
+        logger.info(f"Library index loaded from disk: {count} records")
+    else:
+        stats = library_index.build(
+            tracks=all_tracks,
+            essentia_store=essentia_store,
+            mik_library=mik,
+        )
+        logger.info(
+            f"Library index built: {stats['total']} tracks "
+            f"({stats['with_essentia']} with Essentia, {stats['with_mik']} with MIK)"
+        )
+
     _initialized = True
     logger.info(f"MCP server ready with {len(all_tracks)} tracks")
 
@@ -1567,7 +1588,7 @@ async def analyze_library_essentia(
         ),
     )
 
-    return {
+    result = {
         "total_tracks_in_library": total_in_library,
         "tracks_processed": len(tracks_to_process),
         "analyzed_new": stats["analyzed"],
@@ -1582,6 +1603,106 @@ async def analyze_library_essentia(
             f"{stats['errors']} errors."
         ),
     }
+
+    # Rebuild the library index to incorporate newly analyzed tracks
+    if library_index is not None:
+        fresh_store = EssentiaFeatureStore(engine.tracks) if EssentiaFeatureStore else None
+        idx_stats = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: library_index.build(
+                tracks=engine.tracks,
+                essentia_store=fresh_store,
+                mik_library=_mik_library,
+            ),
+        )
+        result["library_index_rebuilt"] = True
+        result["library_index_total"] = idx_stats["total"]
+        result["library_index_with_essentia"] = idx_stats["with_essentia"]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Library index tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def rebuild_library_index(
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Rebuild the centralized JSONL track library index at .data/library_index.jsonl.
+
+    The index merges Rekordbox metadata, Essentia audio features, and Mixed In Key
+    energy data into one record per track.  It is used by Claude for grep-based
+    searches and can serve as input to a vector store.
+
+    Args:
+        force: If False (default), skip rebuild if the index was written within
+               the last hour. Set True to force a full rebuild regardless.
+
+    Returns:
+        Stats dict with total tracks, Essentia coverage, MIK coverage, file path,
+        and timestamp — or a ``skipped`` dict explaining why rebuild was skipped.
+    """
+    await _ensure_initialized()
+
+    if library_index is None:
+        return {"error": "LibraryIndex not available"}
+
+    if not force and library_index.is_fresh(max_age_seconds=3600):
+        return {
+            "skipped": True,
+            "reason": "Index is fresh (< 1 hour old). Use force=True to rebuild.",
+            "index_path": str(library_index._record_path),
+        }
+
+    fresh_store = EssentiaFeatureStore(engine.tracks) if EssentiaFeatureStore else None
+    stats = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: library_index.build(
+            tracks=engine.tracks,
+            essentia_store=fresh_store,
+            mik_library=_mik_library,
+        ),
+    )
+    return stats
+
+
+@mcp.tool()
+async def get_track_full_info(
+    title_or_id: str,
+) -> Dict[str, Any]:
+    """
+    Return the complete merged record for a track from the library index.
+
+    The record contains all Rekordbox metadata, Essentia audio analysis
+    features, and Mixed In Key energy data in one structure.
+
+    Args:
+        title_or_id: Track title (substring match, case-insensitive) or
+                     Rekordbox track ID (exact match).
+
+    Returns:
+        Complete merged record dict, or an error dict if not found.
+    """
+    await _ensure_initialized()
+
+    if library_index is None:
+        return {"error": "Library index not available — call rebuild_library_index first"}
+
+    # Try exact ID lookup first
+    record = library_index.get_by_id(title_or_id)
+    if record:
+        return record
+
+    # Fall back to title search
+    results = library_index.search(query=title_or_id, limit=1)
+    if results:
+        return results[0]
+
+    return {"error": f"Track not found: '{title_or_id}'"}
 
 
 # ---------------------------------------------------------------------------
