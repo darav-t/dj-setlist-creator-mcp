@@ -64,13 +64,14 @@ mcp = FastMCP("MCP DJ")
 db: Optional[RekordboxDatabase] = None
 engine: Optional[SetlistEngine] = None
 library_index: Optional[LibraryIndex] = None
+library_attributes: Optional[Dict[str, Any]] = None   # dynamic — scanned at build time
 _mik_library: Optional[MixedInKeyLibrary] = None
 _initialized = False
 
 
 async def _ensure_initialized():
     """Lazy-initialize the database and engine on first tool call."""
-    global db, engine, library_index, _mik_library, _initialized
+    global db, engine, library_index, library_attributes, _mik_library, _initialized
     if _initialized:
         return
 
@@ -101,17 +102,26 @@ async def _ensure_initialized():
         essentia_store=essentia_store,
     )
 
-    # Build the centralized library index (merged JSONL for LLM grep + vector search)
+    # Fetch My Tag hierarchy from Rekordbox (used for attribute building)
+    try:
+        my_tag_tree = await db.query_my_tags(limit=500)
+    except Exception:
+        my_tag_tree = []
+
+    # Build the centralized library index + attribute files (all dynamic, no hardcoded values)
     library_index = LibraryIndex()
     if library_index.is_fresh(max_age_seconds=3600):
         count = library_index.load_from_disk()
+        library_attributes = library_index.attributes
         logger.info(f"Library index loaded from disk: {count} records")
     else:
         stats = library_index.build(
             tracks=all_tracks,
             essentia_store=essentia_store,
             mik_library=mik,
+            my_tag_tree=my_tag_tree,
         )
+        library_attributes = library_index.attributes
         logger.info(
             f"Library index built: {stats['total']} tracks "
             f"({stats['with_essentia']} with Essentia, {stats['with_mik']} with MIK)"
@@ -202,6 +212,183 @@ _CROWD_BPM_DELTA = [
     ("relaxed",  -3),
     ("sleepy",   -4),
 ]
+
+def _parse_set_intent(
+    prompt: str,
+    attrs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Parse a free-form natural language set description into structured parameters.
+
+    Uses the dynamically scanned library attributes (``attrs``) so no tag names,
+    genre names, or BPM ranges are hardcoded.  The attributes are built at
+    startup from the actual Rekordbox + Essentia + MIK data.
+
+    Tag matching strategy
+    ---------------------
+    1. Full tag-name substring match  (e.g. prompt contains "afters" → "Afters")
+    2. All-words match for multi-word tags (e.g. "high energy" → "High Energy")
+    3. Tags are ranked by their library track count (most-used first) so the
+       highest-signal tags appear first in the result list.
+
+    Genre / BPM resolution
+    ----------------------
+    1. Match actual genre names from the library (longest first to avoid
+       partial clashes), using that genre's real p25–p75 BPM range.
+    2. Fall back to the venue-keyword table (_VIBE_PROFILES) for BPM guidance
+       while still using real library data to tighten the range when available.
+
+    Args:
+        prompt: Free-form natural language DJ set description.
+        attrs:  Library attributes dict (from LibraryIndex.attributes).
+                If None, falls back to heuristic-only parsing.
+
+    Returns:
+        {my_tags, genre, bpm_min, bpm_max, energy_profile, vibe_label,
+         duration_minutes, reasoning}
+    """
+    import re as _re
+    p = prompt.lower()
+
+    # ------------------------------------------------------------------
+    # 1. My Tag matching — fully dynamic from library data
+    # ------------------------------------------------------------------
+    my_tags: List[str] = []
+    seen_tags: set = set()
+
+    if attrs:
+        tag_details = attrs.get("my_tag_details", {})
+        # Sort by track count descending so the most relevant tags rank first
+        ranked_tags = sorted(
+            tag_details.keys(),
+            key=lambda t: tag_details[t].get("count", 0),
+            reverse=True,
+        )
+        for tag_name in ranked_tags:
+            if tag_name.startswith("---"):
+                continue
+            tag_lower = tag_name.lower()
+            # Full name present in prompt
+            if tag_lower in p:
+                if tag_name not in seen_tags:
+                    my_tags.append(tag_name)
+                    seen_tags.add(tag_name)
+                continue
+            # All significant words of a multi-word tag appear in prompt
+            words = [
+                w for w in tag_lower.split()
+                if len(w) > 3 and w not in {"with", "from", "that", "this"}
+            ]
+            if len(words) >= 2 and all(w in p for w in words):
+                if tag_name not in seen_tags:
+                    my_tags.append(tag_name)
+                    seen_tags.add(tag_name)
+
+    # ------------------------------------------------------------------
+    # 2. Genre + BPM — from real library genre data, then venue keywords
+    # ------------------------------------------------------------------
+    genre: Optional[str] = None
+    bpm_min = 120.0
+    bpm_max = 132.0
+    vibe_label = "Custom"
+
+    if attrs:
+        genre_details = attrs.get("genre_details", {})
+        # Sort longest names first to prevent "House" from shadowing "Tech House"
+        for genre_name in sorted(genre_details, key=len, reverse=True):
+            if genre_name.lower() in p:
+                genre = genre_name
+                vibe_label = genre_name
+                bpm_d = genre_details[genre_name].get("bpm", {})
+                if bpm_d:
+                    # Use interquartile range (p25–p75) as a tight, realistic window
+                    bpm_min = float(bpm_d.get("p25", bpm_d.get("min", 120)))
+                    bpm_max = float(bpm_d.get("p75", bpm_d.get("max", 132)))
+                break
+
+    # Venue/vibe keyword fallback (still overrides BPM with real data if possible)
+    if not genre:
+        for keyword, g, mn, mx, lbl in _VIBE_PROFILES:
+            if keyword in p:
+                genre      = g
+                bpm_min    = float(mn)
+                bpm_max    = float(mx)
+                vibe_label = lbl
+                # Try to replace hardcoded BPM with actual library data
+                if attrs:
+                    gd = attrs.get("genre_details", {})
+                    for lib_genre, ginfo in gd.items():
+                        if g.lower() in lib_genre.lower() or lib_genre.lower() in g.lower():
+                            bpm_d = ginfo.get("bpm", {})
+                            if bpm_d:
+                                bpm_min = float(bpm_d.get("p25", bpm_min))
+                                bpm_max = float(bpm_d.get("p75", bpm_max))
+                            break
+                break
+
+    # ------------------------------------------------------------------
+    # 3. Energy profile — from situation / time-of-day keyword tables
+    #    (these express music-theory/DJ conventions, not user data)
+    # ------------------------------------------------------------------
+    energy_profile: Optional[str] = None
+    for keyword, profile in _SITUATION_TO_PROFILE:
+        if keyword in p:
+            energy_profile = profile
+            break
+    if not energy_profile:
+        for keyword, profile in _TIME_TO_PROFILE:
+            if keyword in p:
+                energy_profile = profile
+                break
+    if not energy_profile:
+        energy_profile = "journey"
+
+    # ------------------------------------------------------------------
+    # 4. BPM nudge from crowd energy
+    # ------------------------------------------------------------------
+    for keyword, delta in _CROWD_BPM_DELTA:
+        if keyword in p:
+            bpm_min += delta
+            bpm_max += delta
+            break
+
+    # ------------------------------------------------------------------
+    # 5. Duration hint  ("2 hour", "90 minute", "45min", "1.5h")
+    # ------------------------------------------------------------------
+    duration: Optional[int] = None
+    m = _re.search(r'(\d+(?:\.\d+)?)\s*(?:hour|hr)s?', p)
+    if m:
+        duration = int(float(m.group(1)) * 60)
+    else:
+        m = _re.search(r'(\d+)\s*(?:minute|min)s?', p)
+        if m:
+            duration = int(m.group(1))
+
+    # ------------------------------------------------------------------
+    # 6. Reasoning string
+    # ------------------------------------------------------------------
+    parts: List[str] = []
+    if my_tags:
+        parts.append(f"My Tags → {', '.join(my_tags[:6])}")
+    if genre:
+        parts.append(f"Genre → {genre} ({vibe_label})")
+    parts.append(f"BPM → {bpm_min:.0f}–{bpm_max:.0f}")
+    parts.append(f"Energy arc → {energy_profile}")
+    if duration:
+        parts.append(f"Duration → {duration} min")
+    if not attrs:
+        parts.append("⚠ Library attributes unavailable — heuristic fallback used")
+
+    return {
+        "my_tags":          my_tags,
+        "genre":            genre,
+        "bpm_min":          bpm_min,
+        "bpm_max":          bpm_max,
+        "energy_profile":   energy_profile,
+        "vibe_label":       vibe_label,
+        "duration_minutes": duration,
+        "reasoning":        " | ".join(parts),
+    }
 
 
 def _interpret_vibe(
@@ -1604,22 +1791,194 @@ async def analyze_library_essentia(
         ),
     }
 
-    # Rebuild the library index to incorporate newly analyzed tracks
+    # Rebuild the library index (+ attributes) to incorporate newly analyzed tracks
     if library_index is not None:
+        global library_attributes
         fresh_store = EssentiaFeatureStore(engine.tracks) if EssentiaFeatureStore else None
+        try:
+            tag_tree = await db.query_my_tags(limit=500)
+        except Exception:
+            tag_tree = []
         idx_stats = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: library_index.build(
                 tracks=engine.tracks,
                 essentia_store=fresh_store,
                 mik_library=_mik_library,
+                my_tag_tree=tag_tree,
             ),
         )
+        library_attributes = library_index.attributes
         result["library_index_rebuilt"] = True
         result["library_index_total"] = idx_stats["total"]
         result["library_index_with_essentia"] = idx_stats["with_essentia"]
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Prompt-driven set builder
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def build_set_from_prompt(
+    prompt: str,
+    duration_minutes: int = 60,
+) -> Dict[str, Any]:
+    """
+    Build a complete DJ set from a single free-form natural language prompt.
+
+    Queries the centralized library index (Rekordbox + Essentia + MIK data) using
+    your Rekordbox My Tags, then applies harmonic mixing (Camelot wheel) and energy
+    arc planning to produce a fully ordered setlist.
+
+    Flow:
+        1. Parse prompt → extract My Tags, genre, BPM range, energy arc
+        2. Filter candidate tracks via My Tag matches in the library index
+        3. Run SetlistEngine on those candidates (harmonic + energy ordering)
+        4. Return track list with transition notes and full intent breakdown
+
+    Examples::
+
+        "60 minute progressive house sunset set"
+        "dark underground techno bangers for afters, build to peak"
+        "festival main stage with famous EDM and vocals, 90 minutes"
+        "2 hour warm-up set, start chill then build through house bangers"
+        "rooftop housy set, high energy, no need for vocals"
+        "wedding set — happy, famous, danceable tracks"
+
+    Args:
+        prompt:           Natural language description of the set you want.
+        duration_minutes: Fallback duration in minutes. Overridden if the prompt
+                         contains an explicit duration (e.g. "2 hour", "90 min").
+
+    Returns:
+        Setlist in the same format as generate_setlist, plus an ``intent`` block
+        explaining which My Tags were detected, how many candidates matched, and
+        the full reasoning chain.
+    """
+    await _ensure_initialized()
+
+    # 1. Parse intent — fully dynamic using scanned library attributes
+    intent = _parse_set_intent(prompt, attrs=library_attributes)
+    if intent["duration_minutes"]:
+        duration_minutes = intent["duration_minutes"]
+    duration_minutes = max(10, min(480, duration_minutes))
+
+    # 2. Query library index for tracks matching detected My Tags
+    candidate_ids: set = set()
+    tag_coverage: Dict[str, int] = {}
+
+    if library_index is not None and intent["my_tags"]:
+        for tag in intent["my_tags"]:
+            matches = library_index.search(my_tag=tag, limit=500)
+            tag_coverage[tag] = len(matches)
+            for rec in matches:
+                candidate_ids.add(rec["id"])
+
+    # 3. Map candidate IDs → TrackWithEnergy objects
+    if candidate_ids:
+        candidate_tracks = [t for t in engine.tracks if str(t.id) in candidate_ids]
+    else:
+        candidate_tracks = []
+
+    # Fallback: if too few MyTag matches, widen to all tracks
+    # (SetlistEngine will still filter by genre/BPM)
+    used_fallback = len(candidate_tracks) < 10
+    if used_fallback:
+        candidate_tracks = engine.tracks
+
+    # 4. Build a temporary engine scoped to the candidate pool
+    from .setlist_engine import SetlistEngine as _SetlistEngine
+    from .camelot import CamelotWheel as _CamelotWheel
+    from .energy_planner import EnergyPlanner as _EnergyPlanner
+
+    temp_engine = _SetlistEngine(
+        tracks=candidate_tracks,
+        camelot=_CamelotWheel(),
+        energy_planner=_EnergyPlanner(),
+        essentia_store=engine.essentia_store,
+    )
+
+    # 5. Generate setlist
+    request = SetlistRequest(
+        prompt=prompt,
+        duration_minutes=duration_minutes,
+        genre=intent["genre"],
+        bpm_min=intent["bpm_min"],
+        bpm_max=intent["bpm_max"],
+        energy_profile=(
+            intent["energy_profile"]
+            if intent["energy_profile"] in ENERGY_PROFILES
+            else "journey"
+        ),
+    )
+    setlist = temp_engine.generate_setlist(request)
+
+    # 6. Register setlist in the main engine so export_setlist_to_rekordbox works
+    engine._setlists[setlist.id] = setlist
+
+    # 7. Essentia enrichment per track
+    ess_store = engine.essentia_store
+
+    def _ess(file_path: Optional[str]) -> Dict:
+        if not ess_store or not file_path:
+            return {}
+        ess = ess_store.get(file_path)
+        if not ess:
+            return {}
+        return {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "dominant_mood": ess.dominant_mood(),
+            "top_genre_discogs": ess.top_genre(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+
+    return {
+        "setlist_id": setlist.id,
+        "name": setlist.name,
+        "prompt": prompt,
+        "intent": {
+            "my_tags_detected": intent["my_tags"],
+            "tag_coverage": tag_coverage,
+            "candidate_pool": (
+                len(candidate_tracks)
+                if not used_fallback
+                else f"{len(candidate_tracks)} (all tracks — no My Tag matches, used genre/BPM fallback)"
+            ),
+            "genre": intent["genre"],
+            "bpm_range": f"{intent['bpm_min']:.0f}–{intent['bpm_max']:.0f}",
+            "energy_profile": intent["energy_profile"],
+            "reasoning": intent["reasoning"],
+        },
+        "track_count": setlist.track_count,
+        "duration_minutes": round(setlist.total_duration_seconds / 60),
+        "avg_bpm": setlist.avg_bpm,
+        "bpm_range": {"min": setlist.bpm_range[0], "max": setlist.bpm_range[1]},
+        "harmonic_score": setlist.harmonic_score,
+        "energy_arc": setlist.energy_arc,
+        "genre_distribution": setlist.genre_distribution,
+        "tracks": [
+            {
+                "position": st.position,
+                "artist": st.track.artist,
+                "title": st.track.title,
+                "bpm": st.track.bpm,
+                "key": st.track.key,
+                "energy": st.track.energy,
+                "genre": st.track.genre,
+                "my_tags": st.track.my_tags,
+                "duration": st.track.duration_formatted(),
+                "key_relation": st.key_relation,
+                "transition_score": st.transition_score,
+                "notes": st.notes,
+                **_ess(st.track.file_path),
+            }
+            for st in setlist.tracks
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1658,15 +2017,22 @@ async def rebuild_library_index(
             "index_path": str(library_index._record_path),
         }
 
+    global library_attributes
     fresh_store = EssentiaFeatureStore(engine.tracks) if EssentiaFeatureStore else None
+    try:
+        tag_tree = await db.query_my_tags(limit=500)
+    except Exception:
+        tag_tree = []
     stats = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: library_index.build(
             tracks=engine.tracks,
             essentia_store=fresh_store,
             mik_library=_mik_library,
+            my_tag_tree=tag_tree,
         ),
     )
+    library_attributes = library_index.attributes
     return stats
 
 
@@ -1703,6 +2069,40 @@ async def get_track_full_info(
         return results[0]
 
     return {"error": f"Track not found: '{title_or_id}'"}
+
+
+@mcp.tool()
+async def get_library_attributes() -> Dict[str, Any]:
+    """
+    Return the dynamically scanned library attribute summary.
+
+    The attributes are built from the actual Rekordbox + Essentia + MIK data
+    at startup (or after rebuild_library_index).  No values are hardcoded.
+
+    The result includes:
+    - my_tag_hierarchy   — tag groups (Has / Vibes / Situation / Bangers / …)
+    - my_tags            — every tag with its track count
+    - my_tag_details     — per-tag BPM range, energy range, dominant mood,
+                           top genres, and co-occurring tags
+    - genres             — every genre with count
+    - genre_details      — per-genre BPM and energy ranges
+    - keys               — Camelot key distribution
+    - bpm                — global BPM stats (min/max/avg/p25/p50/p75)
+    - energy             — energy distribution (1-10) and stats
+    - moods              — Essentia dominant-mood counts
+    - energy_sources     — how many tracks use MIK / album-tag / inferred
+    - date_range         — oldest and newest date_added
+    - top_artists        — top 30 artists by track count
+
+    Use this as context before building a set to understand what your library
+    contains and which tags/genres are most populated.
+    """
+    await _ensure_initialized()
+
+    if library_attributes is None:
+        return {"error": "Library attributes not available — call rebuild_library_index first"}
+
+    return library_attributes
 
 
 # ---------------------------------------------------------------------------

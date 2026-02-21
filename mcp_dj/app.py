@@ -82,6 +82,12 @@ async def lifespan(app_instance: FastAPI):
     except ImportError:
         pass
 
+    # Fetch My Tag hierarchy for dynamic attribute building (no hardcoded values)
+    try:
+        my_tag_tree_app = await db.query_my_tags(limit=500)
+    except Exception:
+        my_tag_tree_app = []
+
     library_index = LibraryIndex()
     if library_index.is_fresh(max_age_seconds=3600):
         count = library_index.load_from_disk()
@@ -91,6 +97,7 @@ async def lifespan(app_instance: FastAPI):
             tracks=all_tracks,
             essentia_store=essentia_store_app,
             mik_library=mik,
+            my_tag_tree=my_tag_tree_app,
         )
         logger.info(
             f"Library index built: {stats['total']} tracks "
@@ -191,12 +198,18 @@ async def rebuild_library_index_endpoint(force: bool = False):
     except ImportError:
         pass
 
+    try:
+        tag_tree_rebuild = await db.query_my_tags(limit=500)
+    except Exception:
+        tag_tree_rebuild = []
+
     stats = await _asyncio.get_event_loop().run_in_executor(
         None,
         lambda: library_index.build(
             tracks=engine.tracks,
             essentia_store=essentia_store_rebuild,
             mik_library=_mik_library_app,
+            my_tag_tree=tag_tree_rebuild,
         ),
     )
     return JSONResponse(stats)
