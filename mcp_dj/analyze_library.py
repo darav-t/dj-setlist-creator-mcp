@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import multiprocessing
 import os
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from multiprocessing import Queue
 
@@ -49,6 +51,44 @@ CYAN   = "\033[0;36m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 NC     = "\033[0m"
+
+# How many tracks to analyze before flushing the index to disk incrementally.
+# Lower = safer against Ctrl+C but slightly more I/O; 10 is a good balance.
+_FLUSH_EVERY = 10
+
+
+class _SingleEssentiaStore:
+    """Minimal EssentiaFeatureStore wrapper for one freshly-analyzed track.
+
+    Passed to ``LibraryIndex.update_record()`` so only this track's features
+    are merged into its JSONL record without needing a full EssentiaFeatureStore
+    over the entire library.
+    """
+
+    def __init__(self, file_path: str, features: object) -> None:
+        self._fp  = file_path
+        self._ess = features
+
+    def get(self, fp: str) -> object:
+        return self._ess if fp == self._fp else None
+
+
+def _load_single_ess(file_path: str) -> object:
+    """Load one track's Essentia features from its per-track cache file.
+
+    Returns an ``EssentiaFeatures`` instance or None on any failure.
+    Safe to call from the main process while workers are still running
+    (each worker writes to its own file path — no races).
+    """
+    try:
+        cache_file = _cache_path(file_path)
+        if cache_file.exists():
+            from .essentia_analyzer import EssentiaFeatures
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+            return EssentiaFeatures(**raw)
+    except Exception:
+        pass
+    return None
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -136,22 +176,33 @@ async def _load_library() -> tuple[list, list]:
     return tracks, my_tags
 
 
-def _build_library_index(tracks: list, my_tag_tree: list) -> dict:
+def _build_library_index(
+    tracks: list,
+    my_tag_tree: list,
+    mik: object = None,
+) -> dict:
     """Rebuild the centralized JSONL library index from freshly analyzed tracks.
 
-    Resolves energy (MIK / album-tag fallback), loads Essentia cache, and writes:
+    Loads the full Essentia cache for every track and writes three output files:
       .data/library_index.jsonl       — one merged record per track
       .data/library_attributes.json  — dynamic tag/genre/BPM attribute summary
       .data/library_context.md        — human-readable LLM context
+
+    Args:
+        tracks:      All TrackWithEnergy instances from Rekordbox.
+        my_tag_tree: Raw rows from ``db.query_my_tags()``.
+        mik:         Already-loaded MixedInKeyLibrary (skips re-loading).
+                     If None, MIK is loaded fresh from the env-configured path.
     """
     from .library_index import LibraryIndex
     from .essentia_analyzer import EssentiaFeatureStore
 
-    mik = MixedInKeyLibrary.from_env()
-    if mik is not None:
-        mik.load()
-    resolver = EnergyResolver(mik)
-    resolver.resolve_all(tracks)
+    if mik is None:
+        mik = MixedInKeyLibrary.from_env()
+        if mik is not None:
+            mik.load()
+        EnergyResolver(mik).resolve_all(tracks)
+    # If mik was passed in, energy is already resolved — skip re-work.
 
     essentia_store = EssentiaFeatureStore(tracks)
     idx = LibraryIndex()
@@ -265,6 +316,31 @@ def main() -> None:
             print(f"  {YELLOW}Warning: library index build failed:{NC} {e}")
         return
 
+    # ── incremental index setup ───────────────────────────────────────────────
+    # Resolve energy and load MIK once upfront so per-track index updates
+    # don't need to re-load them, and so the final _build_library_index()
+    # call can reuse the same MIK instance.
+    from .library_index import LibraryIndex
+
+    mik_incr = MixedInKeyLibrary.from_env()
+    if mik_incr is not None:
+        mik_incr.load()
+    EnergyResolver(mik_incr).resolve_all(tracks)
+
+    # file_path → track lookup for incremental updates
+    fp_to_track: dict[str, object] = {
+        t.file_path: t
+        for t in tracks
+        if getattr(t, "file_path", None)
+    }
+
+    # Load any existing index records so previous sessions' data is preserved
+    # in the incremental writes (tracks not re-analyzed keep their old record).
+    idx_incr = LibraryIndex()
+    idx_incr.load_from_disk()
+    indexed_at  = datetime.now(timezone.utc).isoformat()
+    _since_flush = 0  # count of "ok" tracks since last flush
+
     # ── parallel analysis via queue ───────────────────────────────────────────
     total      = len(to_analyze)
     ctx        = multiprocessing.get_context("spawn")
@@ -318,6 +394,25 @@ def main() -> None:
         if status == "ok":
             stats["ok"] += 1
             durations.append(duration)
+
+            # ── incremental index update ──────────────────────────────────────
+            # Each worker writes its Essentia result to its own cache file
+            # (separate paths — no races). The main process is the sole writer
+            # of the JSONL index, so no locking is needed.
+            track = fp_to_track.get(file_path)
+            if track is not None:
+                ess = _load_single_ess(file_path)
+                store = _SingleEssentiaStore(file_path, ess) if ess else None
+                idx_incr.update_record(
+                    track,
+                    essentia_store=store,
+                    mik_library=mik_incr,
+                    indexed_at=indexed_at,
+                )
+                _since_flush += 1
+                if _since_flush >= _FLUSH_EVERY:
+                    idx_incr.flush_to_disk()
+                    _since_flush = 0
         else:
             stats[status] = stats.get(status, 0) + 1
 
@@ -332,9 +427,9 @@ def main() -> None:
         # (missing — already reported upfront, skip noise)
 
         # Mark next queued item as active (approximate)
-        idx = done + workers - 1
-        if idx < total:
-            active[to_analyze[idx].file_path] = time.monotonic()
+        _next_idx = done + workers - 1
+        if _next_idx < total:
+            active[to_analyze[_next_idx].file_path] = time.monotonic()
 
         _draw_progress(done, total, list(active.keys()), avg_s)
 
@@ -342,6 +437,10 @@ def main() -> None:
 
     for p in procs:
         p.join(timeout=5)
+
+    # Flush any remaining in-memory updates that didn't hit the _FLUSH_EVERY threshold
+    if _since_flush > 0:
+        idx_incr.flush_to_disk()
 
     wall = time.monotonic() - wall_start
     avg_str = f"  Avg/track:  {sum(durations)/len(durations):.1f}s\n" if durations else ""
@@ -356,7 +455,7 @@ def main() -> None:
     # ── rebuild library index ─────────────────────────────────────────────────
     print(f"\n{BOLD}Building library index…{NC}", flush=True)
     try:
-        idx_stats = _build_library_index(tracks, my_tag_tree)
+        idx_stats = _build_library_index(tracks, my_tag_tree, mik=mik_incr)
         print(
             f"  {GREEN}✓{NC} {idx_stats['total']} tracks indexed  "
             f"({idx_stats['with_essentia']} with Essentia, "

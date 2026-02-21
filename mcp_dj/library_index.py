@@ -856,6 +856,65 @@ class LibraryIndex:
         return count
 
     # ------------------------------------------------------------------
+    # Incremental update (called per-track during analysis)
+    # ------------------------------------------------------------------
+
+    def update_record(
+        self,
+        track: Any,
+        essentia_store: Any = None,
+        mik_library: Any = None,
+        indexed_at: str = "",
+    ) -> dict:
+        """
+        Build and store the merged record for a single track in memory.
+
+        Called incrementally from the main process after each Essentia
+        analysis worker result arrives.  Single-writer — no locking needed.
+        Call ``flush_to_disk()`` periodically to persist the running state.
+
+        Args:
+            track:          TrackWithEnergy instance (energy already resolved).
+            essentia_store: Store with a ``.get(file_path)`` method returning
+                            ``EssentiaFeatures`` for this track, or None.
+            mik_library:    MixedInKeyLibrary for MIK energy data, or None.
+            indexed_at:     ISO timestamp string; defaults to now.
+
+        Returns:
+            The built record dict (also stored in ``_by_id``).
+        """
+        record = _build_record_from_track(
+            track,
+            essentia_store=essentia_store,
+            mik_library=mik_library,
+            indexed_at=indexed_at or datetime.now(timezone.utc).isoformat(),
+        )
+        self._by_id[record["id"]] = record
+        self._built = True
+        return record
+
+    def flush_to_disk(self) -> int:
+        """
+        Atomically write all in-memory records to the JSONL file.
+
+        Writes to a ``.tmp`` sibling first, then uses ``Path.replace()``
+        for an atomic rename — safe against mid-write crashes and Ctrl+C.
+        Single-writer; no locking needed when called from the main process.
+
+        Returns:
+            Number of records written (0 if nothing in memory).
+        """
+        if not self._by_id:
+            return 0
+        self._record_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._record_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for record in self._by_id.values():
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        tmp.replace(self._record_path)
+        return len(self._by_id)
+
+    # ------------------------------------------------------------------
     # Repr
     # ------------------------------------------------------------------
 
