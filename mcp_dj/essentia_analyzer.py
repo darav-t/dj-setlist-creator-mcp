@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
@@ -471,6 +471,7 @@ def analyze_library(
     force: bool = False,
     skip_missing: bool = True,
     workers: Optional[int] = None,
+    on_track_complete: Optional[Callable[[str, str, Any], None]] = None,
 ) -> dict[str, Any]:
     """Batch-analyze all tracks that have a file_path.
 
@@ -480,6 +481,10 @@ def analyze_library(
         skip_missing: Log a warning for missing files instead of raising.
         workers: Parallel worker processes. None = auto (cpu_count // 2, max 4).
                  Set to 1 to disable parallelism.
+        on_track_complete: Optional callback invoked after each track is
+            successfully analyzed. Signature: (track_id, file_path, features).
+            Called from the main process/thread — safe for I/O operations like
+            incremental index updates.
 
     Returns:
         Dict with keys: analyzed, cached, skipped_no_path, skipped_missing_file,
@@ -536,6 +541,8 @@ def analyze_library(
                 features = analyze_file(fp, force=force)
                 results[track_id] = features
                 stats["analyzed"] += 1
+                if on_track_complete is not None:
+                    on_track_complete(track_id, fp, features)
             except Exception as e:
                 logger.error(f"Analysis failed for {fp}: {e}")
                 stats["errors"] += 1
@@ -561,6 +568,8 @@ def analyze_library(
                         cached = load_cached_features(fp)
                         if cached is not None:
                             results[track_id] = cached
+                            if on_track_complete is not None:
+                                on_track_complete(track_id, fp, cached)
                         stats["analyzed"] += 1
                     elif status == "missing":
                         stats["skipped_missing_file"] += 1

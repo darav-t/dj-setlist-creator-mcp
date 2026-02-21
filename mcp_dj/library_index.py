@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import threading
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -623,6 +624,7 @@ class LibraryIndex:
         self._by_id: dict[str, dict] = {}
         self._attributes: Optional[dict] = None
         self._built = False
+        self._lock = threading.Lock()  # guards _by_id for concurrent update/flush
 
     # ------------------------------------------------------------------
     # Build
@@ -889,8 +891,9 @@ class LibraryIndex:
             mik_library=mik_library,
             indexed_at=indexed_at or datetime.now(timezone.utc).isoformat(),
         )
-        self._by_id[record["id"]] = record
-        self._built = True
+        with self._lock:
+            self._by_id[record["id"]] = record
+            self._built = True
         return record
 
     def flush_to_disk(self) -> int:
@@ -904,15 +907,17 @@ class LibraryIndex:
         Returns:
             Number of records written (0 if nothing in memory).
         """
-        if not self._by_id:
-            return 0
+        with self._lock:
+            if not self._by_id:
+                return 0
+            records_snapshot = list(self._by_id.values())
         self._record_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._record_path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
-            for record in self._by_id.values():
+            for record in records_snapshot:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         tmp.replace(self._record_path)
-        return len(self._by_id)
+        return len(records_snapshot)
 
     # ------------------------------------------------------------------
     # Repr

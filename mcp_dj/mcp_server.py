@@ -1766,14 +1766,55 @@ async def analyze_library_essentia(
     total_in_library = len(engine.tracks)
     logger.info(f"Starting Essentia library analysis: {len(tracks_to_process)} tracks")
 
+    # Build a fast track_id → track lookup used by the incremental index callback.
+    _track_map = {t.id: t for t in tracks_to_process}
+
+    # Incremental index writer — called from the executor thread after each track.
+    _FLUSH_EVERY = 10
+    _flush_counter = [0]  # list so the closure can mutate it
+
+    def _on_track_complete(track_id: str, file_path: str, features: Any) -> None:
+        if library_index is None:
+            return
+        track = _track_map.get(track_id)
+        if track is None:
+            return
+
+        class _SingleStore:
+            """Minimal essentia-store adapter for a single track's features."""
+            def get(self, fp: str):
+                return features if fp == file_path else None
+
+        try:
+            library_index.update_record(
+                track,
+                essentia_store=_SingleStore(),
+                mik_library=_mik_library,
+            )
+            _flush_counter[0] += 1
+            if _flush_counter[0] % _FLUSH_EVERY == 0:
+                n = library_index.flush_to_disk()
+                logger.info(
+                    f"Incremental index flush: {n} records on disk "
+                    f"({_flush_counter[0]} analyzed so far)"
+                )
+        except Exception as exc:
+            logger.warning(f"Incremental index update failed for {file_path}: {exc}")
+
     stats = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: _essentia_analyze_library(
             tracks=tracks_to_process,
             force=force,
             skip_missing=True,
+            on_track_complete=_on_track_complete,
         ),
     )
+
+    # Flush any remaining records that didn't land on a flush boundary.
+    if library_index is not None and _flush_counter[0] % _FLUSH_EVERY != 0:
+        n = library_index.flush_to_disk()
+        logger.info(f"Final incremental flush: {n} records on disk")
 
     result = {
         "total_tracks_in_library": total_in_library,
