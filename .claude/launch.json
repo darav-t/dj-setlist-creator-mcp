@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "setlist-creator-web",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "python", "-m", "mcp_dj.app"],
+      "port": 8888
+    },
+    {
+      "name": "mcp-dj-http",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "python", "-m", "mcp_dj.mcp_server", "--transport", "sse", "--host", "127.0.0.1", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}
