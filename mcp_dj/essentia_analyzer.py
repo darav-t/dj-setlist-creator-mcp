@@ -233,16 +233,47 @@ def _model_path(filename: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+# Per-process model registry — models are loaded once and reused across tracks.
+# Each worker process (ProcessPoolExecutor uses spawn) has its own independent
+# copy, so there are no cross-process races.
+_MODEL_REGISTRY: dict[str, Any] = {}
+
+# Per-process JSON metadata registry — avoids re-reading .json files per track.
+_META_REGISTRY: dict[str, Any] = {}
+
+
+def _get_model(key: str, loader) -> Any:
+    """Return a cached model instance, loading it on first use in this process."""
+    if key not in _MODEL_REGISTRY:
+        _MODEL_REGISTRY[key] = loader()
+        logger.debug(f"Model loaded into process cache: {key}")
+    return _MODEL_REGISTRY[key]
+
+
+def _get_json_meta(path: Path) -> dict:
+    """Return cached JSON metadata, loading it on first use in this process."""
+    key = str(path)
+    if key not in _META_REGISTRY:
+        with open(path) as f:
+            _META_REGISTRY[key] = json.load(f)
+    return _META_REGISTRY[key]
+
+
 def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeatures:
     """Run TensorFlow-based ML models on the audio file.
 
     Requires essentia-tensorflow or essentia with TF support.
     Gracefully skips any model whose files aren't downloaded.
     Returns the features object updated in-place.
+
+    Models are cached per-process in _MODEL_REGISTRY so they are loaded
+    only once per worker rather than once per track.
     """
-    # Load audio at 16kHz (required by all ML models)
+    # Load audio at 16kHz (required by all ML models).
+    # resampleQuality=1 (sinc_fastest) is measurably faster than the default
+    # (sinc_best=4) with negligible impact on ML model accuracy.
     try:
-        audio_16k = es.MonoLoader(filename=file_path, sampleRate=16000, resampleQuality=4)()
+        audio_16k = es.MonoLoader(filename=file_path, sampleRate=16000, resampleQuality=1)()
     except Exception as e:
         logger.warning(f"ML analysis: failed to load audio at 16kHz: {e}")
         return features
@@ -256,9 +287,12 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if vggish_pb and vggish_json:
         try:
-            vggish_model = es.TensorflowPredictVGGish(
-                graphFilename=str(vggish_pb),
-                output="model/vggish/embeddings",
+            vggish_model = _get_model(
+                "vggish",
+                lambda: es.TensorflowPredictVGGish(
+                    graphFilename=str(vggish_pb),
+                    output="model/vggish/embeddings",
+                ),
             )
             vggish_embeddings = vggish_model(audio_16k)
             logger.debug(f"VGGish embeddings: {vggish_embeddings.shape}")
@@ -272,22 +306,25 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
     # -------------------------------------------------------------------------
     if vggish_embeddings is not None:
         mood_models = {
-            "mood_happy":      ("mood_happy-audioset-vggish-1.pb",      "mood_happy"),
-            "mood_sad":        ("mood_sad-audioset-vggish-1.pb",        "mood_sad"),
-            "mood_aggressive": ("mood_aggressive-audioset-vggish-1.pb", "mood_aggressive"),
-            "mood_relaxed":    ("mood_relaxed-audioset-vggish-1.pb",    "mood_relaxed"),
-            "mood_party":      ("mood_party-audioset-vggish-1.pb",      "mood_party"),
+            "mood_happy":      "mood_happy-audioset-vggish-1.pb",
+            "mood_sad":        "mood_sad-audioset-vggish-1.pb",
+            "mood_aggressive": "mood_aggressive-audioset-vggish-1.pb",
+            "mood_relaxed":    "mood_relaxed-audioset-vggish-1.pb",
+            "mood_party":      "mood_party-audioset-vggish-1.pb",
         }
-        for field_name, (pb_file, _) in mood_models.items():
+        for field_name, pb_file in mood_models.items():
             pb = _model_path(pb_file)
             if not pb:
                 continue
             try:
-                classifier = es.TensorflowPredict2D(
-                    graphFilename=str(pb),
-                    output="model/Softmax",
-                    patchSize=1,
-                    batchSize=-1,
+                classifier = _get_model(
+                    field_name,
+                    lambda _pb=pb: es.TensorflowPredict2D(
+                        graphFilename=str(_pb),
+                        output="model/Softmax",
+                        patchSize=1,
+                        batchSize=-1,
+                    ),
                 )
                 preds = classifier(vggish_embeddings)
                 # preds shape: (n_frames, 2) — class 0 is the positive mood
@@ -307,9 +344,12 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if effnet_pb:
         try:
-            effnet_model = es.TensorflowPredictEffnetDiscogs(
-                graphFilename=str(effnet_pb),
-                output="PartitionedCall:1",  # :1 = 1280-dim embeddings, :0 = 400-class predictions
+            effnet_model = _get_model(
+                "effnet",
+                lambda: es.TensorflowPredictEffnetDiscogs(
+                    graphFilename=str(effnet_pb),
+                    output="PartitionedCall:1",  # :1 = 1280-dim embeddings, :0 = 400-class predictions
+                ),
             )
             effnet_embeddings = effnet_model(audio_16k)
             logger.debug(f"EffNet embeddings: {effnet_embeddings.shape}")
@@ -326,15 +366,16 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if effnet_embeddings is not None and tagging_pb and tagging_json:
         try:
-            with open(tagging_json) as f:
-                tag_meta = json.load(f)
-            tag_classes = tag_meta.get("classes", [])
+            tag_classes = _get_json_meta(tagging_json).get("classes", [])
 
-            tag_classifier = es.TensorflowPredict2D(
-                graphFilename=str(tagging_pb),
-                output="model/Sigmoid",
-                patchSize=1,
-                batchSize=-1,
+            tag_classifier = _get_model(
+                "tagger",
+                lambda: es.TensorflowPredict2D(
+                    graphFilename=str(tagging_pb),
+                    output="model/Sigmoid",
+                    patchSize=1,
+                    batchSize=-1,
+                ),
             )
             tag_preds = tag_classifier(effnet_embeddings)
             avg_tag_preds = tag_preds.mean(axis=0)
@@ -360,16 +401,17 @@ def _run_ml_analysis(file_path: str, features: EssentiaFeatures) -> EssentiaFeat
 
     if effnet_embeddings is not None and genre_pb and genre_json:
         try:
-            with open(genre_json) as f:
-                genre_meta = json.load(f)
-            genre_classes = genre_meta.get("classes", [])
+            genre_classes = _get_json_meta(genre_json).get("classes", [])
 
-            genre_classifier = es.TensorflowPredict2D(
-                graphFilename=str(genre_pb),
-                input="serving_default_model_Placeholder",
-                output="PartitionedCall",
-                patchSize=1,
-                batchSize=-1,
+            genre_classifier = _get_model(
+                "genre",
+                lambda: es.TensorflowPredict2D(
+                    graphFilename=str(genre_pb),
+                    input="serving_default_model_Placeholder",
+                    output="PartitionedCall",
+                    patchSize=1,
+                    batchSize=-1,
+                ),
             )
             genre_preds = genre_classifier(effnet_embeddings)
             avg_genre_preds = genre_preds.mean(axis=0)
@@ -463,7 +505,10 @@ def _analyze_file_task(file_path: str, force: bool) -> tuple[str, str, str]:
 
 def _default_worker_count() -> int:
     cpus = os.cpu_count() or 2
-    return max(1, min(4, cpus // 2))
+    # With per-process model caching each additional worker costs only one
+    # extra round of model loads (not one per track).  Cap at 6 to stay
+    # within ~6-8 GB unified memory on typical Apple Silicon machines.
+    return max(1, min(6, cpus // 2))
 
 
 def analyze_library(

@@ -687,6 +687,118 @@ def _build_text_field(record: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LibraryIndexFeatureStore — EssentiaFeatureStore-compatible adapter
+# ---------------------------------------------------------------------------
+
+class _LibraryEssentiaRecord:
+    """
+    Duck-type adapter for EssentiaFeatures read from a library index record.
+
+    ``EssentiaFeatures.to_cache_dict()`` pre-computes derived fields before
+    writing them to the JSONL, so this adapter exposes the same interface as
+    ``EssentiaFeatures`` without needing to re-load the raw audio cache files:
+
+    * ``energy``       — already 1-10 (converted from integrated_lufs)
+    * ``danceability`` — already 1-10 (converted from Essentia's 0-3 range)
+    * ``mood``         — dict {happy, sad, aggressive, relaxed, party: float}
+    * ``genre``        — dict {genre: score}  ("Electronic---" prefix stripped)
+    * ``tags``         — dict {tag: score}    (flattened from [{tag,score}] list)
+    """
+
+    __slots__ = (
+        "_ess", "bpm_essentia",
+        "mood_happy", "mood_sad", "mood_aggressive", "mood_relaxed", "mood_party",
+        "genre_discogs", "music_tags",
+    )
+
+    def __init__(self, ess: dict) -> None:
+        self._ess = ess
+        self.bpm_essentia: float = float(ess.get("bpm") or 0.0)
+
+        mood = ess.get("mood") or {}
+        self.mood_happy:      Optional[float] = mood.get("happy")
+        self.mood_sad:        Optional[float] = mood.get("sad")
+        self.mood_aggressive: Optional[float] = mood.get("aggressive")
+        self.mood_relaxed:    Optional[float] = mood.get("relaxed")
+        self.mood_party:      Optional[float] = mood.get("party")
+
+        # genre: JSONL already has "Electronic---" prefix stripped;
+        # SetlistEngine accesses this as .genre_discogs
+        self.genre_discogs: Optional[dict] = ess.get("genre") or None
+
+        # tags: JSONL stores {tag: score}; SetlistEngine expects [{tag, score}]
+        tags_dict = ess.get("tags") or {}
+        self.music_tags: Optional[list] = (
+            [{"tag": t, "score": s} for t, s in tags_dict.items()]
+            if tags_dict else None
+        )
+
+    def energy_as_1_to_10(self) -> int:
+        """Already pre-computed in the JSONL from integrated_lufs."""
+        return int(self._ess.get("energy") or 5)
+
+    def danceability_as_1_to_10(self) -> int:
+        """Already pre-computed in the JSONL from Essentia's 0-3 range."""
+        return int(self._ess.get("danceability") or 5)
+
+    def dominant_mood(self) -> Optional[str]:
+        return self._ess.get("dominant_mood")
+
+    def top_genre(self) -> Optional[str]:
+        return self._ess.get("dominant_genre")
+
+
+class LibraryIndexFeatureStore:
+    """
+    EssentiaFeatureStore-compatible adapter backed by the in-memory library index.
+
+    Allows SetlistEngine to use per-track mood / genre / tags vectors stored in
+    ``library_index.jsonl`` for scoring, without loading the separate per-file
+    ``essentia_cache/*.json`` files.  Reads from the already-loaded
+    ``LibraryIndex._by_id`` dict — O(1) lookups, zero additional disk I/O.
+
+    This makes ``library_index.jsonl`` the single source of truth for set
+    building: once the index is built (or loaded from disk), the full audio
+    feature data — including the full mood probability vector, Discogs genre
+    scores, and MagnaTagATune tags — is available for scoring without any
+    on-demand analysis.
+
+    Usage::
+
+        store = LibraryIndexFeatureStore(library_index)
+        ess   = store.get(track.file_path)   # _LibraryEssentiaRecord or None
+        if ess:
+            print(ess.energy_as_1_to_10(), ess.mood_happy)
+    """
+
+    def __init__(self, library_index: "LibraryIndex") -> None:
+        # Build file_path → JSONL record map for all tracks that have Essentia data
+        self._fp_map: dict[str, dict] = {}
+        for record in library_index._by_id.values():
+            fp = record.get("file_path")
+            if fp and "essentia" in record:
+                self._fp_map[fp] = record
+
+    def get(self, file_path: Optional[str]) -> Optional["_LibraryEssentiaRecord"]:
+        """Return a duck-type EssentiaFeatures adapter for *file_path*, or None."""
+        if not file_path:
+            return None
+        rec = self._fp_map.get(file_path)
+        if not rec:
+            return None
+        ess = rec.get("essentia")
+        if not ess:
+            return None
+        return _LibraryEssentiaRecord(ess)
+
+    def __len__(self) -> int:
+        return len(self._fp_map)
+
+    def __repr__(self) -> str:
+        return f"LibraryIndexFeatureStore({len(self._fp_map)} tracks with Essentia data)"
+
+
+# ---------------------------------------------------------------------------
 # LibraryIndex
 # ---------------------------------------------------------------------------
 

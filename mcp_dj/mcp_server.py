@@ -37,7 +37,7 @@ from .camelot import CamelotWheel
 from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
 from .models import SetlistRequest
-from .library_index import LibraryIndex
+from .library_index import LibraryIndex, LibraryIndexFeatureStore
 
 # Optional Essentia integration — gracefully unavailable if not installed
 try:
@@ -1935,11 +1935,21 @@ async def build_set_from_prompt(
     from .camelot import CamelotWheel as _CamelotWheel
     from .energy_planner import EnergyPlanner as _EnergyPlanner
 
+    # Prefer the library index as the feature source — it holds the full
+    # mood / genre / tags vectors in-memory (already loaded from JSONL) and
+    # requires no extra disk I/O.  Fall back to engine.essentia_store for any
+    # tracks analyzed after the last index build.
+    ess_store = (
+        LibraryIndexFeatureStore(library_index)
+        if library_index is not None and len(library_index._by_id) > 0
+        else engine.essentia_store
+    )
+
     temp_engine = _SetlistEngine(
         tracks=candidate_tracks,
         camelot=_CamelotWheel(),
         energy_planner=_EnergyPlanner(),
-        essentia_store=engine.essentia_store,
+        essentia_store=ess_store,
     )
 
     # 5. Generate setlist
