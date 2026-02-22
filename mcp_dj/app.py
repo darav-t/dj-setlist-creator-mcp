@@ -2,21 +2,35 @@
 FastAPI Web Application for MCP DJ
 
 Endpoints:
-  GET  /                          - Serve the chat UI
-  GET  /api/library/stats         - Library statistics
-  GET  /api/library/tracks        - Search/list tracks
-  POST /api/chat                  - Chat with AI
-  POST /api/setlist/generate      - Direct setlist generation
-  POST /api/setlist/recommend     - Next-track recommendations
-  POST /api/setlist/export        - Export setlist to Rekordbox playlist
-  GET  /api/setlist/{id}          - Retrieve a generated setlist
+  GET  /                               - Serve the chat UI
+  GET  /api/library/stats              - Library statistics
+  GET  /api/library/attributes         - Full dynamic library attribute summary
+  GET  /api/library/tracks             - Search/list tracks (supports my_tag, date filters)
+  GET  /api/library/track/{id}         - Full merged record for a single track
+  POST /api/library/rebuild-index      - Rebuild the centralized JSONL library index
+
+  POST /api/chat                       - Chat with AI
+  POST /api/chat/clear                 - Clear conversation history
+
+  POST /api/setlist/generate           - Direct setlist generation (structured params)
+  POST /api/setlist/plan               - Vibe-based setlist (freeform context → params)
+  POST /api/setlist/build              - Prompt-driven setlist (natural language + MyTags)
+  GET  /api/setlist/{id}               - Retrieve a generated setlist
+  POST /api/setlist/recommend          - Next-track recommendations
+  POST /api/setlist/compatibility      - Harmonic compatibility between two tracks
+  POST /api/setlist/energy-flow        - Energy-arc analysis for a track sequence
+  POST /api/setlist/compatible-tracks  - Find tracks compatible with a given key/BPM
+
+  POST /api/essentia/analyze           - Analyze a single audio file with Essentia
+  POST /api/essentia/analyze-library   - Batch-analyze the full library with Essentia
 """
 
+import asyncio
 import os
 import uvicorn
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -31,7 +45,24 @@ from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
 from .ai_integration import SetlistAI
 from .models import SetlistRequest
-from .library_index import LibraryIndex
+from .library_index import LibraryIndex, LibraryIndexFeatureStore
+from .intent import parse_set_intent, interpret_vibe
+
+# Optional Essentia integration
+try:
+    from .essentia_analyzer import (
+        analyze_file as _essentia_analyze_file,
+        analyze_library as _essentia_analyze_library,
+        EssentiaFeatureStore,
+        ESSENTIA_AVAILABLE,
+        CACHE_DIR as ESSENTIA_CACHE_DIR,
+    )
+except ImportError:
+    ESSENTIA_AVAILABLE = False
+    _essentia_analyze_file = None
+    _essentia_analyze_library = None
+    EssentiaFeatureStore = None
+    ESSENTIA_CACHE_DIR = None
 
 # ---------------------------------------------------------------------------
 # Singletons
@@ -44,6 +75,7 @@ planner = EnergyPlanner()
 engine = SetlistEngine(camelot=camelot, energy_planner=planner)
 ai: Optional[SetlistAI] = None
 library_index: Optional[LibraryIndex] = None
+library_attributes: Optional[Dict[str, Any]] = None   # dynamic — scanned at build time
 _mik_library_app: Optional[MixedInKeyLibrary] = None
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -55,7 +87,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    global ai, energy_resolver, library_index, _mik_library_app
+    global ai, energy_resolver, library_index, library_attributes, _mik_library_app
 
     # Startup
     await db.connect()
@@ -76,11 +108,8 @@ async def lifespan(app_instance: FastAPI):
 
     # Build the centralized library index (merged JSONL for LLM grep + vector search)
     essentia_store_app = None
-    try:
-        from .essentia_analyzer import EssentiaFeatureStore
+    if EssentiaFeatureStore is not None:
         essentia_store_app = EssentiaFeatureStore(all_tracks)
-    except ImportError:
-        pass
 
     # Fetch My Tag hierarchy for dynamic attribute building (no hardcoded values)
     try:
@@ -91,6 +120,7 @@ async def lifespan(app_instance: FastAPI):
     library_index = LibraryIndex()
     if library_index.is_fresh(max_age_seconds=3600):
         count = library_index.load_from_disk()
+        library_attributes = library_index.attributes
         logger.info(f"Library index loaded from disk: {count} records")
     else:
         stats = library_index.build(
@@ -99,14 +129,21 @@ async def lifespan(app_instance: FastAPI):
             mik_library=mik,
             my_tag_tree=my_tag_tree_app,
         )
+        library_attributes = library_index.attributes
         logger.info(
             f"Library index built: {stats['total']} tracks "
             f"({stats['with_essentia']} with Essentia, {stats['with_mik']} with MIK)"
         )
 
-    # Initialize AI
+    # Initialize AI — pass library context so Claude can use MyTag-aware set building
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    ai = SetlistAI(engine=engine, api_key=api_key)
+    ai = SetlistAI(
+        engine=engine,
+        api_key=api_key,
+        library_index=library_index,
+        library_attributes=library_attributes,
+        mik_library=mik,
+    )
     if api_key:
         logger.info("Claude API key found. AI chat enabled.")
     else:
@@ -130,13 +167,17 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — UI
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
+
+# ---------------------------------------------------------------------------
+# Routes — Library
+# ---------------------------------------------------------------------------
 
 @app.get("/api/library/stats")
 async def library_stats():
@@ -148,12 +189,65 @@ async def library_stats():
     return JSONResponse(summary)
 
 
+@app.get("/api/library/attributes")
+async def get_library_attributes():
+    """Full dynamic library attribute summary (tags, genres, BPM/energy distributions, co-occurrence).
+
+    Attributes are built from actual Rekordbox + Essentia + MIK data at startup
+    and refreshed whenever the library index is rebuilt.  No values are hardcoded.
+    """
+    if library_attributes is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Library attributes not available — rebuild the index first.",
+        )
+    return JSONResponse(library_attributes)
+
+
 @app.get("/api/library/tracks")
-async def library_tracks(search: Optional[str] = None, limit: int = 100):
-    """Search/list tracks from the library."""
-    tracks = await db.search_tracks(query=search or "", limit=min(limit, 500))
-    return JSONResponse([
-        {
+async def library_tracks(
+    search: Optional[str] = None,
+    my_tag: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+):
+    """Search/list tracks from the library.
+
+    Query params:
+        search:    Text search (title, artist, genre, album).
+        my_tag:    Filter by Rekordbox My Tag label (e.g. 'High Energy').
+        date_from: Include only tracks added on/after this date (YYYY-MM-DD).
+        date_to:   Include only tracks added on/before this date (YYYY-MM-DD).
+        limit:     Maximum results (default 100, capped at 500).
+    """
+    q = (search or "").strip().lower()
+    tag_filter = (my_tag or "").strip().lower()
+    limit = min(limit, 500)
+    results = []
+
+    for t in engine.tracks:
+        # Text filter
+        if q and not (
+            q in t.title.lower()
+            or q in t.artist.lower()
+            or q in (t.genre or "").lower()
+            or q in (t.album or "").lower()
+        ):
+            continue
+
+        # Date filter (lexicographic comparison works for YYYY-MM-DD strings)
+        d = t.date_added or ""
+        if date_from and d < date_from:
+            continue
+        if date_to and d > date_to:
+            continue
+
+        # My Tag filter
+        if tag_filter and not any(tag_filter in tag.lower() for tag in t.my_tags):
+            continue
+
+        results.append({
             "id": t.id,
             "title": t.title,
             "artist": t.artist,
@@ -167,9 +261,39 @@ async def library_tracks(search: Optional[str] = None, limit: int = 100):
             "length": t.length,
             "duration": t.duration_formatted(),
             "color": t.color,
-        }
-        for t in tracks
-    ])
+            "date_added": t.date_added,
+            "my_tags": t.my_tags,
+        })
+        if len(results) >= limit:
+            break
+
+    return JSONResponse(results)
+
+
+@app.get("/api/library/track/{track_id}")
+async def get_track_full_info(track_id: str):
+    """Return the complete merged record for a track from the library index.
+
+    The record contains all Rekordbox metadata, Essentia audio features, and
+    Mixed In Key energy data in one structure.
+
+    Path param:
+        track_id: Rekordbox track ID (exact) or title substring (case-insensitive).
+    """
+    if library_index is None:
+        raise HTTPException(status_code=503, detail="Library index not initialized")
+
+    # Try exact ID lookup first
+    record = library_index.get_by_id(track_id)
+    if record:
+        return JSONResponse(record)
+
+    # Fall back to title substring search
+    results = library_index.search(query=track_id, limit=1)
+    if results:
+        return JSONResponse(results[0])
+
+    raise HTTPException(status_code=404, detail=f"Track not found: '{track_id}'")
 
 
 @app.post("/api/library/rebuild-index")
@@ -179,7 +303,7 @@ async def rebuild_library_index_endpoint(force: bool = False):
     Query params:
         force: If true, rebuild even if the index is fresh (< 1 hour old).
     """
-    import asyncio as _asyncio
+    global library_attributes
 
     if library_index is None:
         raise HTTPException(status_code=503, detail="Library index not initialized")
@@ -192,18 +316,15 @@ async def rebuild_library_index_endpoint(force: bool = False):
         })
 
     essentia_store_rebuild = None
-    try:
-        from .essentia_analyzer import EssentiaFeatureStore
+    if EssentiaFeatureStore is not None:
         essentia_store_rebuild = EssentiaFeatureStore(engine.tracks)
-    except ImportError:
-        pass
 
     try:
         tag_tree_rebuild = await db.query_my_tags(limit=500)
     except Exception:
         tag_tree_rebuild = []
 
-    stats = await _asyncio.get_event_loop().run_in_executor(
+    stats = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: library_index.build(
             tracks=engine.tracks,
@@ -212,11 +333,25 @@ async def rebuild_library_index_endpoint(force: bool = False):
             my_tag_tree=tag_tree_rebuild,
         ),
     )
+    library_attributes = library_index.attributes
+
+    # Refresh engine's essentia store so live set-building immediately uses updated data
+    if essentia_store_rebuild is not None:
+        engine.essentia_store = essentia_store_rebuild
+
+    # Propagate fresh library context to the AI assistant
+    if ai is not None:
+        ai.update_library_context(
+            library_index=library_index,
+            library_attributes=library_attributes,
+            mik_library=_mik_library_app,
+        )
+
     return JSONResponse(stats)
 
 
 # ---------------------------------------------------------------------------
-# Chat
+# Routes — Chat
 # ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
@@ -253,14 +388,274 @@ async def clear_chat():
 
 
 # ---------------------------------------------------------------------------
-# Direct setlist generation
+# Routes — Setlist generation
 # ---------------------------------------------------------------------------
 
 @app.post("/api/setlist/generate")
 async def generate_setlist(request: SetlistRequest):
-    """Generate a setlist directly (without chat)."""
+    """Generate a setlist directly (structured parameters)."""
     setlist = engine.generate_setlist(request)
     return JSONResponse(setlist.model_dump())
+
+
+class PlanSetRequest(BaseModel):
+    duration_minutes: int = 60
+    vibe: str = ""
+    situation: str = ""
+    venue: str = ""
+    crowd_energy: str = ""
+    time_of_day: str = ""
+    genre_preference: Optional[str] = None
+
+
+@app.post("/api/setlist/plan")
+async def plan_set(body: PlanSetRequest):
+    """Build a setlist from a vibe description rather than technical parameters.
+
+    Translates freeform context (vibe, venue, situation, crowd, time) into
+    genre/BPM/energy-arc parameters, then generates and returns a full setlist
+    alongside an interpretation block showing how the vibe was mapped.
+    """
+    interpretation = interpret_vibe(
+        vibe=body.vibe,
+        situation=body.situation,
+        venue=body.venue,
+        crowd_energy=body.crowd_energy,
+        time_of_day=body.time_of_day,
+        genre_preference=body.genre_preference or "",
+    )
+
+    context_parts = [p for p in [body.vibe, body.situation, body.venue] if p]
+    prompt = " | ".join(context_parts) if context_parts else f"{body.duration_minutes}min set"
+
+    request = SetlistRequest(
+        prompt=prompt,
+        duration_minutes=max(10, min(480, body.duration_minutes)),
+        genre=interpretation["genre"],
+        bpm_min=interpretation["bpm_min"],
+        bpm_max=interpretation["bpm_max"],
+        energy_profile=interpretation["energy_profile"],
+    )
+
+    setlist = engine.generate_setlist(request)
+    essentia_store = engine.essentia_store
+
+    def _ess(file_path):
+        if not essentia_store:
+            return {}
+        ess = essentia_store.get(file_path)
+        if not ess:
+            return {}
+        return {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "dominant_mood": ess.dominant_mood(),
+            "top_genre_discogs": ess.top_genre(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+
+    return JSONResponse({
+        "interpretation": {
+            "vibe_label": interpretation["vibe_label"],
+            "genre": interpretation["genre"],
+            "bpm_range": f"{interpretation['bpm_min']:.0f}–{interpretation['bpm_max']:.0f}",
+            "energy_profile": interpretation["energy_profile"],
+            "reasoning": interpretation["reasoning"],
+        },
+        "setlist_id": setlist.id,
+        "name": setlist.name,
+        "track_count": setlist.track_count,
+        "duration_minutes": round(setlist.total_duration_seconds / 60),
+        "avg_bpm": setlist.avg_bpm,
+        "bpm_range": {"min": setlist.bpm_range[0], "max": setlist.bpm_range[1]},
+        "harmonic_score": setlist.harmonic_score,
+        "energy_arc": setlist.energy_arc,
+        "genre_distribution": setlist.genre_distribution,
+        "tracks": [
+            {
+                "position": st.position,
+                "artist": st.track.artist,
+                "title": st.track.title,
+                "bpm": st.track.bpm,
+                "key": st.track.key,
+                "energy": st.track.energy,
+                "genre": st.track.genre,
+                "duration": st.track.duration_formatted(),
+                "key_relation": st.key_relation,
+                "transition_score": st.transition_score,
+                "notes": st.notes,
+                **_ess(st.track.file_path),
+            }
+            for st in setlist.tracks
+        ],
+    })
+
+
+class BuildSetRequest(BaseModel):
+    prompt: str
+    duration_minutes: int = 60
+
+
+@app.post("/api/setlist/build")
+async def build_set_from_prompt(body: BuildSetRequest):
+    """Build a complete DJ set from a single free-form natural language prompt.
+
+    Queries the library index using Rekordbox My Tags detected in the prompt,
+    then applies harmonic mixing and energy-arc planning.
+
+    Examples:
+      "60 minute progressive house sunset set"
+      "dark underground techno bangers for afters, build to peak"
+      "festival main stage with famous EDM and vocals, 90 minutes"
+      "wedding set — happy, famous, danceable tracks"
+    """
+    if library_index is None:
+        raise HTTPException(status_code=503, detail="Library index not initialized")
+
+    # 1. Parse intent — fully dynamic using scanned library attributes
+    intent = parse_set_intent(body.prompt, attrs=library_attributes)
+    duration_minutes = intent["duration_minutes"] or body.duration_minutes
+    duration_minutes = max(10, min(480, duration_minutes))
+
+    # 2. Query library index for tracks matching detected My Tags
+    candidate_ids: set = set()
+    tag_coverage: Dict[str, int] = {}
+
+    if intent["my_tags"]:
+        for tag in intent["my_tags"]:
+            matches = library_index.search(my_tag=tag, limit=500)
+            tag_coverage[tag] = len(matches)
+            for rec in matches:
+                candidate_ids.add(rec["id"])
+
+    # 3. Map candidate IDs → TrackWithEnergy objects
+    if candidate_ids:
+        candidate_tracks = [t for t in engine.tracks if str(t.id) in candidate_ids]
+    else:
+        candidate_tracks = []
+
+    # Fallback: if too few MyTag matches, widen to all tracks
+    used_fallback = len(candidate_tracks) < 10
+    if used_fallback:
+        candidate_tracks = engine.tracks
+
+    # 4. Build a temporary engine scoped to the candidate pool.
+    #    Use the library index as the feature source (mood/genre/tags vectors
+    #    already in-memory from JSONL — no extra disk I/O).
+    from .setlist_engine import SetlistEngine as _SetlistEngine
+    from .camelot import CamelotWheel as _CamelotWheel
+    from .energy_planner import EnergyPlanner as _EnergyPlanner
+
+    ess_store = (
+        LibraryIndexFeatureStore(library_index)
+        if library_index is not None and len(library_index._by_id) > 0
+        else engine.essentia_store
+    )
+
+    temp_engine = _SetlistEngine(
+        tracks=candidate_tracks,
+        camelot=_CamelotWheel(),
+        energy_planner=_EnergyPlanner(),
+        essentia_store=ess_store,
+    )
+
+    # 5. Generate setlist
+    request = SetlistRequest(
+        prompt=body.prompt,
+        duration_minutes=duration_minutes,
+        genre=intent["genre"],
+        bpm_min=intent["bpm_min"],
+        bpm_max=intent["bpm_max"],
+        energy_profile=(
+            intent["energy_profile"]
+            if intent["energy_profile"] in ENERGY_PROFILES
+            else "journey"
+        ),
+    )
+    setlist = temp_engine.generate_setlist(request)
+
+    # 6. Register setlist in the main engine so export works
+    engine._setlists[setlist.id] = setlist
+
+    # 7. Per-track Essentia enrichment
+    main_ess = engine.essentia_store
+
+    def _ess(file_path: Optional[str]) -> Dict:
+        if not main_ess or not file_path:
+            return {}
+        ess = main_ess.get(file_path)
+        if not ess:
+            return {}
+        out: Dict = {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+        mood: Dict = {}
+        for key, val in [
+            ("happy",      ess.mood_happy),
+            ("sad",        ess.mood_sad),
+            ("aggressive", ess.mood_aggressive),
+            ("relaxed",    ess.mood_relaxed),
+            ("party",      ess.mood_party),
+        ]:
+            if val is not None:
+                mood[key] = round(val, 2)
+        if mood:
+            out["mood"] = mood
+            out["dominant_mood"] = max(mood, key=mood.get)
+        if ess.genre_discogs:
+            sorted_genres = sorted(ess.genre_discogs.items(), key=lambda x: x[1], reverse=True)
+            out["top_genres"] = {g: round(s, 3) for g, s in sorted_genres[:3]}
+            out["top_genre_discogs"] = sorted_genres[0][0] if sorted_genres else None
+        if ess.music_tags:
+            sorted_tags = sorted(ess.music_tags, key=lambda t: t["score"], reverse=True)
+            out["top_tags"] = {t["tag"]: round(t["score"], 3) for t in sorted_tags[:5]}
+        return out
+
+    return JSONResponse({
+        "setlist_id": setlist.id,
+        "name": setlist.name,
+        "prompt": body.prompt,
+        "intent": {
+            "my_tags_detected": intent["my_tags"],
+            "tag_coverage": tag_coverage,
+            "candidate_pool": (
+                len(candidate_tracks)
+                if not used_fallback
+                else f"{len(candidate_tracks)} (all tracks — no My Tag matches, used genre/BPM fallback)"
+            ),
+            "genre": intent["genre"],
+            "bpm_range": f"{intent['bpm_min']:.0f}–{intent['bpm_max']:.0f}",
+            "energy_profile": intent["energy_profile"],
+            "reasoning": intent["reasoning"],
+        },
+        "track_count": setlist.track_count,
+        "duration_minutes": round(setlist.total_duration_seconds / 60),
+        "avg_bpm": setlist.avg_bpm,
+        "bpm_range": {"min": setlist.bpm_range[0], "max": setlist.bpm_range[1]},
+        "harmonic_score": setlist.harmonic_score,
+        "energy_arc": setlist.energy_arc,
+        "genre_distribution": setlist.genre_distribution,
+        "tracks": [
+            {
+                "position": st.position,
+                "artist": st.track.artist,
+                "title": st.track.title,
+                "bpm": st.track.bpm,
+                "key": st.track.key,
+                "energy": st.track.energy,
+                "genre": st.track.genre,
+                "my_tags": st.track.my_tags,
+                "duration": st.track.duration_formatted(),
+                "key_relation": st.key_relation,
+                "transition_score": st.transition_score,
+                "notes": st.notes,
+                **_ess(st.track.file_path),
+            }
+            for st in setlist.tracks
+        ],
+    })
 
 
 @app.get("/api/setlist/{setlist_id}")
@@ -273,7 +668,7 @@ async def get_setlist(setlist_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Recommendations
+# Routes — Recommendations & analysis
 # ---------------------------------------------------------------------------
 
 class RecommendRequest(BaseModel):
@@ -285,7 +680,7 @@ class RecommendRequest(BaseModel):
 
 @app.post("/api/setlist/recommend")
 async def recommend_next(body: RecommendRequest):
-    """Get next-track recommendations."""
+    """Get next-track recommendations based on harmonic compatibility and energy flow."""
     recs = engine.recommend_next(
         current_track_id=body.track_id,
         current_track_title=body.track_title,
@@ -295,8 +690,176 @@ async def recommend_next(body: RecommendRequest):
     return JSONResponse([r.model_dump() for r in recs])
 
 
+class CompatibilityRequest(BaseModel):
+    track_a_title: str
+    track_b_title: str
+
+
+@app.post("/api/setlist/compatibility")
+async def get_track_compatibility(body: CompatibilityRequest):
+    """Check harmonic and energy compatibility between two tracks."""
+    track_a = next(
+        (t for t in engine.tracks if body.track_a_title.lower() in t.title.lower()), None
+    )
+    track_b = next(
+        (t for t in engine.tracks if body.track_b_title.lower() in t.title.lower()), None
+    )
+
+    if not track_a:
+        raise HTTPException(status_code=404, detail=f"Track not found: '{body.track_a_title}'")
+    if not track_b:
+        raise HTTPException(status_code=404, detail=f"Track not found: '{body.track_b_title}'")
+
+    h_score, rel = camelot.transition_score(track_a.key or "", track_b.key or "")
+    bpm_pct_diff = (
+        abs(track_b.bpm - track_a.bpm) / track_a.bpm * 100
+        if track_a.bpm > 0 else 0
+    )
+    energy_delta = (track_b.energy or 5) - (track_a.energy or 5)
+
+    verdict = (
+        "Excellent mix" if h_score >= 0.85 and bpm_pct_diff <= 4
+        else "Good mix" if h_score >= 0.65
+        else "Acceptable mix" if h_score >= 0.4
+        else "Difficult transition"
+    )
+
+    return JSONResponse({
+        "track_a": {
+            "artist": track_a.artist, "title": track_a.title,
+            "bpm": track_a.bpm, "key": track_a.key, "energy": track_a.energy,
+        },
+        "track_b": {
+            "artist": track_b.artist, "title": track_b.title,
+            "bpm": track_b.bpm, "key": track_b.key, "energy": track_b.energy,
+        },
+        "harmonic_score": h_score,
+        "key_relationship": rel,
+        "bpm_difference": round(track_b.bpm - track_a.bpm, 1),
+        "bpm_pct_difference": round(bpm_pct_diff, 1),
+        "energy_delta": energy_delta,
+        "verdict": verdict,
+    })
+
+
+class EnergyFlowRequest(BaseModel):
+    track_titles: List[str]
+
+
+@app.post("/api/setlist/energy-flow")
+async def analyze_energy_flow(body: EnergyFlowRequest):
+    """Analyze the energy flow of a sequence of tracks."""
+    found_tracks = [
+        next((t for t in engine.tracks if title.lower() in t.title.lower()), None)
+        for title in body.track_titles
+    ]
+
+    energies = [(t.energy or 5) if t else 5 for t in found_tracks]
+    n = len(energies)
+
+    target_journey = [
+        round(planner.get_target_energy(i / max(1, n - 1), "journey"))
+        for i in range(n)
+    ]
+
+    issues = []
+    for i in range(1, n):
+        delta = abs(energies[i] - energies[i - 1])
+        if delta > 3:
+            issues.append(f"Position {i+1}: Large energy jump ({delta} levels)")
+    for i in range(2, n):
+        if energies[i] == energies[i - 1] == energies[i - 2]:
+            issues.append(f"Position {i+1}: Plateau detected (3+ tracks at E{energies[i]})")
+
+    return JSONResponse({
+        "track_count": n,
+        "energy_values": energies,
+        "target_journey": target_journey,
+        "avg_energy": round(sum(energies) / n, 1) if energies else 0,
+        "energy_range": {"min": min(energies), "max": max(energies)} if energies else {},
+        "issues": issues,
+        "score": round(1.0 - len(issues) / max(n, 1), 2),
+        "tracks_found": [
+            {
+                "title": t.title, "energy": t.energy,
+                "key": t.key, "bpm": t.bpm,
+            }
+            if t else None
+            for t in found_tracks
+        ],
+    })
+
+
+class CompatibleTracksRequest(BaseModel):
+    key: str
+    bpm: Optional[float] = None
+    bpm_tolerance: float = 4.0
+    energy_min: Optional[int] = None
+    energy_max: Optional[int] = None
+    genre: Optional[str] = None
+    limit: int = 20
+
+
+@app.post("/api/setlist/compatible-tracks")
+async def get_compatible_tracks(body: CompatibleTracksRequest):
+    """Find tracks in the library compatible with a given Camelot key and optional BPM."""
+    compatible_keys = camelot.get_compatible_keys(body.key)
+    if not compatible_keys:
+        raise HTTPException(status_code=400, detail=f"Invalid Camelot key: {body.key}")
+
+    results = []
+    for track in engine.tracks:
+        if not track.key:
+            continue
+        tk = track.key.strip().upper()
+        if tk not in compatible_keys:
+            continue
+        h_score = compatible_keys[tk]
+
+        if body.bpm is not None and track.bpm > 0:
+            pct_diff = abs(track.bpm - body.bpm) / body.bpm * 100
+            if pct_diff > body.bpm_tolerance:
+                continue
+
+        if body.energy_min is not None and (track.energy or 0) < body.energy_min:
+            continue
+        if body.energy_max is not None and (track.energy or 10) > body.energy_max:
+            continue
+
+        if body.genre and track.genre and body.genre.lower() not in track.genre.lower():
+            continue
+
+        _, rel = camelot.transition_score(body.key, track.key)
+
+        entry: Dict[str, Any] = {
+            "artist": track.artist,
+            "title": track.title,
+            "bpm": track.bpm,
+            "key": track.key,
+            "energy": track.energy,
+            "genre": track.genre,
+            "rating": track.rating,
+            "harmonic_score": h_score,
+            "key_relationship": rel,
+        }
+
+        if engine.essentia_store:
+            ess = engine.essentia_store.get(track.file_path)
+            if ess:
+                entry["essentia_energy"] = ess.energy_as_1_to_10()
+                entry["danceability"] = ess.danceability_as_1_to_10()
+                entry["dominant_mood"] = ess.dominant_mood()
+                entry["top_genre_discogs"] = ess.top_genre()
+                entry["lufs"] = round(ess.integrated_lufs, 1)
+
+        results.append(entry)
+
+    results.sort(key=lambda x: (-x["harmonic_score"], -(x.get("rating") or 0)))
+    return JSONResponse(results[:body.limit])
+
+
 # ---------------------------------------------------------------------------
-# Export
+# Routes — Export
 # ---------------------------------------------------------------------------
 
 class ExportRequest(BaseModel):
@@ -320,6 +883,204 @@ async def export_to_rekordbox(body: ExportRequest):
         return {"success": True, "playlist_id": playlist_id, "track_count": len(track_ids)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Routes — Essentia audio analysis
+# ---------------------------------------------------------------------------
+
+class AnalyzeTrackRequest(BaseModel):
+    file_path: str
+    force: bool = False
+
+
+@app.post("/api/essentia/analyze")
+async def analyze_track(body: AnalyzeTrackRequest):
+    """Analyze a single audio file with Essentia.
+
+    Extracts BPM, key, danceability, loudness, mood scores, genre classification,
+    and music tags. Results are cached so the same file is never analyzed twice.
+    """
+    if not ESSENTIA_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Essentia is not installed. Run: pip install essentia",
+        )
+
+    try:
+        features = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _essentia_analyze_file(body.file_path, force=body.force)
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Audio file not found: {body.file_path}")
+    except Exception as e:
+        logger.error(f"Essentia analysis failed for {body.file_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+    return JSONResponse({
+        "file_path": features.file_path,
+        "analyzed_at": features.analyzed_at,
+        "essentia_version": features.essentia_version,
+        "analysis_seconds": features.analysis_duration_seconds,
+        "bpm": {
+            "value": round(features.bpm_essentia, 2),
+            "confidence": round(features.bpm_confidence, 3),
+            "beats_count": features.beats_count,
+        },
+        "key": {
+            "camelot": features.key_essentia,
+            "raw": f"{features.key_name_raw} {features.key_scale}" if features.key_name_raw else None,
+            "strength": round(features.key_strength, 3),
+        },
+        "danceability": {
+            "score": round(features.danceability, 3),
+            "scale_1_to_10": features.danceability_as_1_to_10(),
+        },
+        "loudness": {
+            "integrated_lufs": round(features.integrated_lufs, 2),
+            "loudness_range_db": round(features.loudness_range_db, 2),
+            "rms_db": round(features.rms_db, 2),
+            "rms_linear": round(features.rms_energy, 5),
+            "scale_1_to_10": features.energy_as_1_to_10(),
+        },
+        "mood": {
+            "happy":      round(features.mood_happy, 3)      if features.mood_happy      is not None else None,
+            "sad":        round(features.mood_sad, 3)        if features.mood_sad        is not None else None,
+            "aggressive": round(features.mood_aggressive, 3) if features.mood_aggressive is not None else None,
+            "relaxed":    round(features.mood_relaxed, 3)    if features.mood_relaxed    is not None else None,
+            "party":      round(features.mood_party, 3)      if features.mood_party      is not None else None,
+            "dominant":   features.dominant_mood(),
+        },
+        "genre_discogs": features.genre_discogs,
+        "music_tags": features.music_tags,
+        "cache_directory": str(ESSENTIA_CACHE_DIR),
+    })
+
+
+class AnalyzeLibraryRequest(BaseModel):
+    force: bool = False
+    limit: Optional[int] = None
+
+
+@app.post("/api/essentia/analyze-library")
+async def analyze_library_essentia(body: AnalyzeLibraryRequest):
+    """Batch-analyze all tracks in the library with Essentia.
+
+    CPU-intensive — may take several minutes for large libraries.  Results are
+    cached; already-analyzed tracks are skipped unless force=true.  The library
+    index is automatically rebuilt after analysis so new features are immediately
+    available for set building.
+    """
+    global library_attributes
+
+    if not ESSENTIA_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Essentia is not installed. Run: pip install essentia",
+        )
+
+    tracks_to_process = engine.tracks
+    if body.limit is not None:
+        tracks_to_process = tracks_to_process[:body.limit]
+
+    total_in_library = len(engine.tracks)
+    logger.info(f"Starting Essentia library analysis: {len(tracks_to_process)} tracks")
+
+    _track_map = {t.id: t for t in tracks_to_process}
+    _FLUSH_EVERY = 10
+    _flush_counter = [0]
+
+    def _on_track_complete(track_id: str, file_path: str, features: Any) -> None:
+        if library_index is None:
+            return
+        track = _track_map.get(track_id)
+        if track is None:
+            return
+
+        class _SingleStore:
+            def get(self, fp: str):
+                return features if fp == file_path else None
+
+        try:
+            library_index.update_record(
+                track,
+                essentia_store=_SingleStore(),
+                mik_library=_mik_library_app,
+            )
+            _flush_counter[0] += 1
+            if _flush_counter[0] % _FLUSH_EVERY == 0:
+                n = library_index.flush_to_disk()
+                logger.info(
+                    f"Incremental index flush: {n} records on disk "
+                    f"({_flush_counter[0]} analyzed so far)"
+                )
+        except Exception as exc:
+            logger.warning(f"Incremental index update failed for {file_path}: {exc}")
+
+    stats = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _essentia_analyze_library(
+            tracks=tracks_to_process,
+            force=body.force,
+            skip_missing=True,
+            on_track_complete=_on_track_complete,
+        ),
+    )
+
+    # Final flush for any remaining records not on a flush boundary
+    if library_index is not None and _flush_counter[0] % _FLUSH_EVERY != 0:
+        n = library_index.flush_to_disk()
+        logger.info(f"Final incremental flush: {n} records on disk")
+
+    result: Dict[str, Any] = {
+        "total_tracks_in_library": total_in_library,
+        "tracks_processed": len(tracks_to_process),
+        "analyzed_new": stats["analyzed"],
+        "loaded_from_cache": stats["cached"],
+        "skipped_no_file_path": stats["skipped_no_path"],
+        "skipped_missing_file": stats["skipped_missing_file"],
+        "errors": stats["errors"],
+        "cache_directory": str(ESSENTIA_CACHE_DIR),
+        "message": (
+            f"Analysis complete. {stats['analyzed']} new tracks analyzed, "
+            f"{stats['cached']} loaded from cache, "
+            f"{stats['errors']} errors."
+        ),
+    }
+
+    # Rebuild the library index to incorporate newly analyzed tracks
+    if library_index is not None:
+        fresh_store = EssentiaFeatureStore(engine.tracks) if EssentiaFeatureStore else None
+        try:
+            tag_tree = await db.query_my_tags(limit=500)
+        except Exception:
+            tag_tree = []
+        idx_stats = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: library_index.build(
+                tracks=engine.tracks,
+                essentia_store=fresh_store,
+                mik_library=_mik_library_app,
+                my_tag_tree=tag_tree,
+            ),
+        )
+        library_attributes = library_index.attributes
+        if fresh_store is not None:
+            engine.essentia_store = fresh_store
+
+        # Propagate fresh library context to the AI assistant
+        if ai is not None:
+            ai.update_library_context(
+                library_index=library_index,
+                library_attributes=library_attributes,
+                mik_library=_mik_library_app,
+            )
+
+        result["library_index_rebuilt"] = True
+        result["library_index_total"] = idx_stats["total"]
+        result["library_index_with_essentia"] = idx_stats["with_essentia"]
+
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
