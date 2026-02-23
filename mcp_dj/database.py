@@ -7,7 +7,7 @@ to the rekordbox library for setlist generation.
 
 import os
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 
 from pyrekordbox import Rekordbox6Database
 from loguru import logger
@@ -467,12 +467,69 @@ class RekordboxDatabase:
     # Playlist creation (for export)
     # ------------------------------------------------------------------
 
-    async def create_playlist_with_tracks(self, name: str, track_ids: List[str]) -> str:
-        """Create a new Rekordbox playlist and add tracks to it."""
+    def find_folder(self, folder_name: str) -> Optional[Any]:
+        """Find a Rekordbox playlist folder by name. Returns the folder object or None."""
+        if not self.db:
+            raise RuntimeError("Database not connected")
+        try:
+            result = self.db.get_playlist(Name=folder_name, Attribute=1)
+            folders = list(result)
+            folders = [f for f in folders if getattr(f, "rb_local_deleted", 0) == 0]
+            return folders[0] if folders else None
+        except Exception:
+            return None
+
+    def find_or_create_folder(self, folder_name: str, parent_id: Optional[str] = None) -> Any:
+        """Find an existing folder by name or create it. Returns the folder object."""
         if not self.db:
             raise RuntimeError("Database not connected")
 
-        playlist = self.db.create_playlist(name=name)
+        # Look for an existing folder with this name
+        existing = self.find_folder(folder_name)
+        if existing:
+            logger.info(f"Found existing folder '{folder_name}' (ID={existing.ID})")
+            return existing
+
+        # Create the folder
+        parent = parent_id if parent_id else None
+        folder = self.db.create_playlist_folder(name=folder_name, parent=parent)
+        self._force_commit()
+        logger.info(f"Created folder '{folder_name}' (ID={folder.ID})")
+        return folder
+
+    async def create_folder(self, folder_name: str, parent_id: Optional[str] = None) -> str:
+        """Create a Rekordbox playlist folder. Returns the folder ID."""
+        if not self.db:
+            raise RuntimeError("Database not connected")
+        folder = self.find_or_create_folder(folder_name, parent_id=parent_id)
+        return str(folder.ID)
+
+    async def create_playlist_with_tracks(
+        self,
+        name: str,
+        track_ids: List[str],
+        folder_name: Optional[str] = None,
+        parent_id: Optional[str] = None,
+    ) -> str:
+        """Create a new Rekordbox playlist and add tracks to it.
+
+        Args:
+            name: Playlist name.
+            track_ids: Ordered list of Rekordbox content IDs.
+            folder_name: If provided, place the playlist inside this folder (created if absent).
+            parent_id: Raw folder ID to use as parent (takes precedence over folder_name).
+        """
+        if not self.db:
+            raise RuntimeError("Database not connected")
+
+        # Resolve parent folder
+        parent = None
+        if parent_id:
+            parent = parent_id
+        elif folder_name:
+            parent = self.find_or_create_folder(folder_name)
+
+        playlist = self.db.create_playlist(name=name, parent=parent)
         self._force_commit()
         playlist_id = playlist.ID if hasattr(playlist, "ID") else int(str(playlist))
 
@@ -485,6 +542,153 @@ class RekordboxDatabase:
         self._force_commit()
         logger.info(f"Created playlist '{name}' with {len(track_ids)} tracks")
         return str(playlist_id)
+
+    # ------------------------------------------------------------------
+    # Playlist editing (scoped to a named folder)
+    # ------------------------------------------------------------------
+
+    def _get_playlist_in_folder(self, playlist_id: str, folder_name: str) -> Any:
+        """Return a playlist object, raising if it doesn't live inside folder_name."""
+        if not self.db:
+            raise RuntimeError("Database not connected")
+        folder = self.find_folder(folder_name)
+        if folder is None:
+            raise ValueError(f"Folder '{folder_name}' not found")
+        results = list(self.db.get_playlist(ID=playlist_id))
+        if not results:
+            raise ValueError(f"Playlist {playlist_id} not found")
+        pl = results[0]
+        if str(pl.ParentID) != str(folder.ID):
+            raise ValueError(f"Playlist '{pl.Name}' is not inside folder '{folder_name}'")
+        return pl
+
+    async def list_playlists_in_folder(self, folder_name: str) -> List[dict]:
+        """List all playlists inside the named folder (not sub-folders)."""
+        if not self.db:
+            raise RuntimeError("Database not connected")
+        folder = self.find_folder(folder_name)
+        if folder is None:
+            return []
+        rows = list(self.db.get_playlist(ParentID=folder.ID))
+        rows = [r for r in rows if getattr(r, "rb_local_deleted", 0) == 0 and r.Attribute == 0]
+        rows.sort(key=lambda r: getattr(r, "Seq", 0) or 0)
+        result = []
+        for r in rows:
+            songs = list(self.db.get_playlist_songs(PlaylistID=r.ID))
+            songs = [s for s in songs if getattr(s, "rb_local_deleted", 0) == 0]
+            result.append({
+                "id": str(r.ID),
+                "name": r.Name,
+                "track_count": len(songs),
+                "seq": getattr(r, "Seq", None),
+            })
+        return result
+
+    async def get_playlist_tracks(self, playlist_id: str) -> List[dict]:
+        """Return the ordered track list for a playlist."""
+        if not self.db:
+            raise RuntimeError("Database not connected")
+        songs = list(self.db.get_playlist_songs(PlaylistID=playlist_id))
+        songs = [s for s in songs if getattr(s, "rb_local_deleted", 0) == 0]
+        songs.sort(key=lambda s: getattr(s, "TrackNo", 0) or 0)
+        result = []
+        for s in songs:
+            content = None
+            try:
+                hits = list(self.db.get_content(ID=s.ContentID))
+                content = hits[0] if hits else None
+            except Exception:
+                pass
+            title = getattr(content, "Title", None) or f"Track {s.ContentID}"
+            artist = getattr(content, "ArtistName", None) or ""
+            bpm_raw = getattr(content, "BPM", 0) or 0
+            bpm = round(float(bpm_raw) / 100.0, 1) if bpm_raw else 0.0
+            result.append({
+                "position": s.TrackNo,
+                "song_id": str(s.ID),
+                "content_id": str(s.ContentID),
+                "title": title,
+                "artist": artist,
+                "bpm": bpm,
+            })
+        return result
+
+    async def rename_mcp_playlist(
+        self, playlist_id: str, new_name: str, folder_name: str
+    ) -> str:
+        """Rename a playlist that lives inside folder_name. Returns old name."""
+        pl = self._get_playlist_in_folder(playlist_id, folder_name)
+        old_name = pl.Name
+        self.db.rename_playlist(pl, new_name)
+        self._force_commit()
+        logger.info(f"Renamed playlist '{old_name}' → '{new_name}'")
+        return old_name
+
+    async def add_tracks_to_mcp_playlist(
+        self,
+        playlist_id: str,
+        track_ids: List[str],
+        position: Optional[int],
+        folder_name: str,
+    ) -> int:
+        """Add tracks to a playlist. Returns updated track count."""
+        pl = self._get_playlist_in_folder(playlist_id, folder_name)
+        track_no = position
+        for tid in track_ids:
+            try:
+                self.db.add_to_playlist(pl, int(tid), track_no=track_no)
+                if track_no is not None:
+                    track_no += 1
+            except Exception as e:
+                logger.warning(f"Failed to add track {tid} to playlist: {e}")
+        self._force_commit()
+        songs = [s for s in list(self.db.get_playlist_songs(PlaylistID=playlist_id))
+                 if getattr(s, "rb_local_deleted", 0) == 0]
+        return len(songs)
+
+    async def remove_track_from_mcp_playlist(
+        self, playlist_id: str, position: int, folder_name: str
+    ) -> dict:
+        """Remove the track at the given 1-based position. Returns removed track info."""
+        pl = self._get_playlist_in_folder(playlist_id, folder_name)
+        songs = list(self.db.get_playlist_songs(PlaylistID=playlist_id))
+        songs = [s for s in songs if getattr(s, "rb_local_deleted", 0) == 0]
+        song = next((s for s in songs if s.TrackNo == position), None)
+        if song is None:
+            raise ValueError(f"No track at position {position}")
+        # Capture info before removal
+        content = None
+        try:
+            hits = list(self.db.get_content(ID=song.ContentID))
+            content = hits[0] if hits else None
+        except Exception:
+            pass
+        title = getattr(content, "Title", None) or f"Track {song.ContentID}"
+        self.db.remove_from_playlist(pl, song)
+        self._force_commit()
+        return {"removed_position": position, "title": title}
+
+    async def reorder_track_in_mcp_playlist(
+        self, playlist_id: str, from_position: int, to_position: int, folder_name: str
+    ) -> None:
+        """Move a track from from_position to to_position (both 1-based)."""
+        pl = self._get_playlist_in_folder(playlist_id, folder_name)
+        songs = list(self.db.get_playlist_songs(PlaylistID=playlist_id))
+        songs = [s for s in songs if getattr(s, "rb_local_deleted", 0) == 0]
+        song = next((s for s in songs if s.TrackNo == from_position), None)
+        if song is None:
+            raise ValueError(f"No track at position {from_position}")
+        self.db.move_song_in_playlist(pl, song, new_track_no=to_position)
+        self._force_commit()
+
+    async def delete_mcp_playlist(self, playlist_id: str, folder_name: str) -> str:
+        """Delete a playlist (must be inside folder_name). Returns deleted name."""
+        pl = self._get_playlist_in_folder(playlist_id, folder_name)
+        name = pl.Name
+        self.db.delete_playlist(pl)
+        self._force_commit()
+        logger.info(f"Deleted playlist '{name}' (ID={playlist_id})")
+        return name
 
     def _force_commit(self) -> None:
         """Commit via SQLAlchemy session directly."""

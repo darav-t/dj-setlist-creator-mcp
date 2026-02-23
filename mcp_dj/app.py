@@ -865,22 +865,168 @@ async def get_compatible_tracks(body: CompatibleTracksRequest):
 class ExportRequest(BaseModel):
     setlist_id: str
     playlist_name: str
+    folder_name: str = "MCP-DJ Sets"
 
 
 @app.post("/api/setlist/export")
 async def export_to_rekordbox(body: ExportRequest):
-    """Export a setlist to a Rekordbox playlist."""
+    """Export a setlist to a Rekordbox playlist, placed in the given folder."""
     setlist = engine.get_setlist(body.setlist_id)
     if not setlist:
         raise HTTPException(status_code=404, detail="Setlist not found")
 
     track_ids = [st.track.id for st in setlist.tracks]
+    resolved_folder = body.folder_name.strip() if body.folder_name else None
     try:
         playlist_id = await db.create_playlist_with_tracks(
             name=body.playlist_name,
             track_ids=track_ids,
+            folder_name=resolved_folder,
         )
-        return {"success": True, "playlist_id": playlist_id, "track_count": len(track_ids)}
+        return {
+            "success": True,
+            "playlist_id": playlist_id,
+            "folder_name": resolved_folder,
+            "track_count": len(track_ids),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateFolderRequest(BaseModel):
+    folder_name: str
+    parent_folder_name: Optional[str] = None
+
+
+@app.post("/api/rekordbox/folder")
+async def create_rekordbox_folder(body: CreateFolderRequest):
+    """Create (or find) a Rekordbox playlist folder."""
+    try:
+        parent_id = None
+        if body.parent_folder_name:
+            parent = db.find_folder(body.parent_folder_name.strip())
+            if parent is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Parent folder '{body.parent_folder_name}' not found",
+                )
+            parent_id = str(parent.ID)
+        folder_id = await db.create_folder(body.folder_name.strip(), parent_id=parent_id)
+        return {"success": True, "folder_id": folder_id, "folder_name": body.folder_name.strip()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Routes — MCP-DJ Sets playlist editing
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FOLDER = "MCP-DJ Sets"
+
+
+@app.get("/api/rekordbox/playlists")
+async def list_mcp_playlists(folder_name: str = _DEFAULT_FOLDER):
+    """List all playlists in the given folder."""
+    playlists = await db.list_playlists_in_folder(folder_name)
+    return {"folder_name": folder_name, "playlists": playlists}
+
+
+@app.get("/api/rekordbox/playlists/{playlist_id}/tracks")
+async def get_mcp_playlist_tracks(playlist_id: str, folder_name: str = _DEFAULT_FOLDER):
+    """Get the ordered track list for a playlist."""
+    try:
+        pl = db._get_playlist_in_folder(playlist_id, folder_name)
+        tracks = await db.get_playlist_tracks(playlist_id)
+        return {"playlist_id": playlist_id, "playlist_name": pl.Name, "tracks": tracks}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+class RenameMcpPlaylistRequest(BaseModel):
+    new_name: str
+    folder_name: str = _DEFAULT_FOLDER
+
+
+@app.patch("/api/rekordbox/playlists/{playlist_id}/rename")
+async def rename_mcp_playlist(playlist_id: str, body: RenameMcpPlaylistRequest):
+    """Rename a playlist."""
+    try:
+        old_name = await db.rename_mcp_playlist(playlist_id, body.new_name, body.folder_name)
+        return {"success": True, "old_name": old_name, "new_name": body.new_name}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AddTracksRequest(BaseModel):
+    track_ids: List[str]
+    position: Optional[int] = None
+    folder_name: str = _DEFAULT_FOLDER
+
+
+@app.post("/api/rekordbox/playlists/{playlist_id}/tracks")
+async def add_tracks_to_mcp_playlist(playlist_id: str, body: AddTracksRequest):
+    """Add tracks by content ID to a playlist."""
+    try:
+        new_count = await db.add_tracks_to_mcp_playlist(
+            playlist_id, body.track_ids, body.position, body.folder_name
+        )
+        return {"success": True, "new_track_count": new_count}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RemoveTrackRequest(BaseModel):
+    folder_name: str = _DEFAULT_FOLDER
+
+
+@app.delete("/api/rekordbox/playlists/{playlist_id}/tracks/{position}")
+async def remove_track_from_mcp_playlist(
+    playlist_id: str, position: int, folder_name: str = _DEFAULT_FOLDER
+):
+    """Remove the track at the given 1-based position."""
+    try:
+        info = await db.remove_track_from_mcp_playlist(playlist_id, position, folder_name)
+        return {"success": True, **info}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ReorderTrackRequest(BaseModel):
+    from_position: int
+    to_position: int
+    folder_name: str = _DEFAULT_FOLDER
+
+
+@app.post("/api/rekordbox/playlists/{playlist_id}/tracks/reorder")
+async def reorder_track_in_mcp_playlist(playlist_id: str, body: ReorderTrackRequest):
+    """Move a track to a new position."""
+    try:
+        await db.reorder_track_in_mcp_playlist(
+            playlist_id, body.from_position, body.to_position, body.folder_name
+        )
+        return {"success": True, "moved_from": body.from_position, "moved_to": body.to_position}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/rekordbox/playlists/{playlist_id}")
+async def delete_mcp_playlist(playlist_id: str, folder_name: str = _DEFAULT_FOLDER):
+    """Delete a playlist from the folder."""
+    try:
+        name = await db.delete_mcp_playlist(playlist_id, folder_name)
+        return {"success": True, "deleted_name": name}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

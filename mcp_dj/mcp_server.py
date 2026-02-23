@@ -635,6 +635,7 @@ async def export_setlist_to_rekordbox(
     setlist_name: str,
     track_titles: Optional[List[str]] = None,
     setlist_id: Optional[str] = None,
+    folder_name: str = "MCP-DJ Sets",
 ) -> Dict[str, Any]:
     """
     Create a Rekordbox playlist from a setlist.
@@ -643,6 +644,8 @@ async def export_setlist_to_rekordbox(
         setlist_name: Name for the new Rekordbox playlist
         track_titles: List of track titles in order. Use if setlist_id is not available.
         setlist_id: ID of a previously generated setlist. If provided, track_titles ignored.
+        folder_name: Rekordbox folder to place the playlist in (created if it doesn't exist).
+                     Defaults to "MCP-DJ Sets". Pass an empty string to place at root.
 
     Returns:
         Result with playlist_id on success.
@@ -671,16 +674,281 @@ async def export_setlist_to_rekordbox(
         return {"success": False, "error": "No tracks found to export"}
 
     try:
+        resolved_folder = folder_name.strip() if folder_name else ""
         playlist_id = await db.create_playlist_with_tracks(
-            name=setlist_name, track_ids=track_ids
+            name=setlist_name,
+            track_ids=track_ids,
+            folder_name=resolved_folder or None,
         )
+        location = f"folder '{resolved_folder}'" if resolved_folder else "root"
         return {
             "success": True,
             "playlist_id": playlist_id,
             "playlist_name": setlist_name,
+            "folder_name": resolved_folder or None,
             "track_count": len(track_ids),
-            "message": f"Created playlist '{setlist_name}' with {len(track_ids)} tracks in Rekordbox",
+            "message": f"Created playlist '{setlist_name}' with {len(track_ids)} tracks in Rekordbox ({location})",
         }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def create_rekordbox_folder(
+    folder_name: str,
+    parent_folder_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a Rekordbox playlist folder (or find it if it already exists).
+
+    Args:
+        folder_name: Name of the folder to create.
+        parent_folder_name: Optional parent folder name. If provided, the new folder
+                            is nested inside the parent (which must already exist).
+
+    Returns:
+        Result with folder_id on success.
+    """
+    await _ensure_initialized()
+
+    try:
+        parent_id = None
+        if parent_folder_name:
+            parent_folder = db.find_folder(parent_folder_name.strip())
+            if parent_folder is None:
+                return {
+                    "success": False,
+                    "error": f"Parent folder '{parent_folder_name}' not found",
+                }
+            parent_id = str(parent_folder.ID)
+
+        folder_id = await db.create_folder(folder_name.strip(), parent_id=parent_id)
+        return {
+            "success": True,
+            "folder_id": folder_id,
+            "folder_name": folder_name.strip(),
+            "parent_folder_name": parent_folder_name,
+            "message": f"Folder '{folder_name}' ready (ID={folder_id})",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# MCP-DJ Sets — playlist editing tools
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FOLDER = "MCP-DJ Sets"
+
+
+@mcp.tool()
+async def list_mcp_playlists(
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    List all playlists inside the MCP-DJ Sets folder (or another named folder).
+
+    Args:
+        folder_name: Folder to list. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        List of playlists with id, name, and track_count.
+    """
+    await _ensure_initialized()
+    try:
+        playlists = await db.list_playlists_in_folder(folder_name)
+        return {"success": True, "folder_name": folder_name, "playlists": playlists}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def get_mcp_playlist_tracks(
+    playlist_id: str,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Get the ordered track list for a playlist in the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID (from list_mcp_playlists).
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Playlist name and list of tracks with position, title, artist, bpm.
+    """
+    await _ensure_initialized()
+    try:
+        pl = db._get_playlist_in_folder(playlist_id, folder_name)
+        tracks = await db.get_playlist_tracks(playlist_id)
+        return {
+            "success": True,
+            "playlist_id": playlist_id,
+            "playlist_name": pl.Name,
+            "track_count": len(tracks),
+            "tracks": tracks,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def rename_mcp_playlist(
+    playlist_id: str,
+    new_name: str,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Rename a playlist in the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID.
+        new_name: New name for the playlist.
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Success result with old and new names.
+    """
+    await _ensure_initialized()
+    try:
+        old_name = await db.rename_mcp_playlist(playlist_id, new_name, folder_name)
+        return {
+            "success": True,
+            "playlist_id": playlist_id,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def add_tracks_to_mcp_playlist(
+    playlist_id: str,
+    track_titles: List[str],
+    position: Optional[int] = None,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Add tracks (by title) to a playlist in the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID.
+        track_titles: List of track titles to add (substring match).
+        position: 1-based position to insert at. Omit to append at end.
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Success result with updated track count and any unmatched titles.
+    """
+    await _ensure_initialized()
+    track_ids: List[str] = []
+    unmatched: List[str] = []
+    for title in track_titles:
+        track = next(
+            (t for t in engine.tracks if title.lower() in t.title.lower()), None
+        )
+        if track:
+            track_ids.append(track.id)
+        else:
+            unmatched.append(title)
+
+    if not track_ids:
+        return {"success": False, "error": "No matching tracks found", "unmatched": unmatched}
+
+    try:
+        new_count = await db.add_tracks_to_mcp_playlist(
+            playlist_id, track_ids, position, folder_name
+        )
+        return {
+            "success": True,
+            "playlist_id": playlist_id,
+            "added": len(track_ids),
+            "new_track_count": new_count,
+            "unmatched": unmatched,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def remove_track_from_mcp_playlist(
+    playlist_id: str,
+    position: int,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Remove the track at a given position from a playlist in the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID.
+        position: 1-based track position to remove.
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Success result with the removed track title.
+    """
+    await _ensure_initialized()
+    try:
+        info = await db.remove_track_from_mcp_playlist(playlist_id, position, folder_name)
+        return {"success": True, "playlist_id": playlist_id, **info}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def reorder_track_in_mcp_playlist(
+    playlist_id: str,
+    from_position: int,
+    to_position: int,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Move a track to a new position within a playlist in the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID.
+        from_position: Current 1-based position of the track.
+        to_position: Target 1-based position.
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Success result.
+    """
+    await _ensure_initialized()
+    try:
+        await db.reorder_track_in_mcp_playlist(
+            playlist_id, from_position, to_position, folder_name
+        )
+        return {
+            "success": True,
+            "playlist_id": playlist_id,
+            "moved_from": from_position,
+            "moved_to": to_position,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def delete_mcp_playlist(
+    playlist_id: str,
+    folder_name: str = _DEFAULT_FOLDER,
+) -> Dict[str, Any]:
+    """
+    Delete a playlist from the MCP-DJ Sets folder.
+
+    Args:
+        playlist_id: Rekordbox playlist ID.
+        folder_name: Folder the playlist lives in. Defaults to "MCP-DJ Sets".
+
+    Returns:
+        Success result with the deleted playlist name.
+    """
+    await _ensure_initialized()
+    try:
+        name = await db.delete_mcp_playlist(playlist_id, folder_name)
+        return {"success": True, "deleted_playlist_id": playlist_id, "deleted_name": name}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
