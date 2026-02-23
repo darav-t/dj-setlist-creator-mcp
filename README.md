@@ -1,4 +1,4 @@
-# MCP DJ - DJ Setlist Creator
+# MCP DJ™ — DJ Setlist Creator
 
 AI-powered DJ setlist generator with harmonic mixing and energy arc planning, built on your local Rekordbox library.
 

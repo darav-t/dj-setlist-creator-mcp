@@ -2,6 +2,8 @@
 name = "mcp-dj"
 version = "1.0.0"
 description = "AI-powered DJ Setlist Creator with harmonic mixing and energy planning"
+license = {file = "LICENSE"}
+authors = [{name = "Varad T"}]
 requires-python = ">=3.12"
 dependencies = [
     "pyrekordbox>=0.4.3",
