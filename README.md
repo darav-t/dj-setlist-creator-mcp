@@ -125,34 +125,49 @@ Your Rekordbox library (read-only)
 
 ## Requirements
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) package manager
 - Rekordbox 6 installed with a library
 - (Optional) [Mixed In Key](https://mixedinkey.com/) with CSV export
 - (Optional) Anthropic API key for AI chat
 - (Optional) [essentia-tensorflow](https://essentia.upf.edu/) for ML audio analysis
 
+> **Nothing else required up-front.** The master installer handles Python 3.12, uv, all packages, Rekordbox setup, and Claude Desktop registration automatically.
+
 ---
 
 ## Quick Start
 
+### macOS / Linux — one command from zero
+
 ```bash
-# 1. Clone the repo
-git clone https://github.com/darav-t/dj-setlist-creator-mcp.git
-cd dj-setlist-creator-mcp
+# With Essentia ML audio analysis (recommended):
+./install-master.sh --essentia
 
-# 2. Run the install script (handles uv, Python, deps, and .env setup)
-./install.sh
+# Core only (faster, no audio analysis):
+./install-master.sh
+```
 
-# For Essentia ML audio analysis (recommended):
-./install.sh --essentia
+### Windows — open PowerShell and run:
 
-# 3. Start the web UI
+```powershell
+# Allow scripts to run (one-time, current user only):
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
+# With Essentia ML audio analysis (recommended):
+.\install-master.ps1 -Essentia
+
+# Core only:
+.\install-master.ps1
+```
+
+Both scripts install Python 3.12, uv, all project dependencies, configure Rekordbox access, create your `.env`, register the MCP server in Claude Desktop, and optionally run a full library analysis — all in one go. No pre-installed Python or package managers needed.
+
+```bash
+# After install, start the web UI:
 ./run-server.sh
 # Opens at http://localhost:8888
 ```
 
-> The install script sets up everything including pyrekordbox database keys and your `.env` file. Run `./install.sh --help` for all options.
+> **Already have Python and uv?** Run `./install.sh` (macOS/Linux) or see `docs/setup.md` for the manual install path.
 
 ---
 
@@ -240,7 +255,7 @@ The MCP server runs via your project's virtualenv (`.venv`). Use the same style 
 }
 ```
 
-Run `./install.sh` to have this entry added to your Claude Desktop config automatically.
+Run `./install-master.sh` (macOS/Linux) or `.\install-master.ps1` (Windows) to have this entry added automatically. Or run `./install.sh` if you already have Python and uv set up.
 
 Or run the MCP server manually:
 
@@ -302,11 +317,14 @@ dj-setlist-creator-mcp/
 │   ├── models/              # ML model files (~300 MB, downloaded once)
 │   ├── library_index.jsonl  # Merged track index (Rekordbox + Essentia + MIK)
 │   └── library_attributes.json  # Dynamic attribute summary (tags, genres, BPM/energy)
-├── install.sh               # Full install script (core + optional Essentia)
+├── install-master.sh        # ← START HERE (macOS/Linux): zero-to-running, no Python needed
+├── install-master.ps1       # ← START HERE (Windows): zero-to-running, no Python needed
+├── install.sh               # Standard install (requires Python + uv already installed)
 ├── analyze-library.sh       # Batch-analyze Rekordbox library with Essentia
 ├── download_models.sh       # Download Essentia ML models
 ├── run-server.sh            # Start the web UI
 ├── run-mcp.sh               # Start the MCP server
+├── docs/                    # Full documentation (setup, library analysis, building sets, reference)
 ├── .env.example             # Configuration template
 └── pyproject.toml
 ```
