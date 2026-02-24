@@ -2127,6 +2127,176 @@ async def build_set_from_prompt(
     }
 
 
+@mcp.tool()
+async def find_tracks_for_prompt(
+    prompt: str,
+    my_tags: Optional[List[str]] = None,
+    genre: Optional[str] = None,
+    bpm_min: Optional[float] = None,
+    bpm_max: Optional[float] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """
+    Find ALL tracks in the library that match a natural language set description.
+
+    Unlike build_set_from_prompt which creates a curated, harmonically-ordered
+    setlist, this tool returns every candidate track that fits the prompt's
+    criteria. Use it to explore what's available before committing to a set,
+    or to answer questions like "what dark techno bangers do I have?".
+
+    The prompt is parsed for My Tags, genre, BPM range, and vibe keywords using
+    the same intent engine as build_set_from_prompt. Results are sorted by
+    relevance: tracks that match more of the detected tags rank higher, then by
+    energy level.
+
+    Args:
+        prompt:   Natural language description (e.g. "dark underground techno bangers").
+        my_tags:  Explicit My Tag names — overrides tags inferred from the prompt.
+        genre:    Genre filter — overrides genre inferred from the prompt.
+        bpm_min:  Minimum BPM. Overrides value inferred from the prompt.
+        bpm_max:  Maximum BPM. Overrides value inferred from the prompt.
+        limit:    Maximum number of tracks to return (default 100, max 500).
+
+    Returns:
+        Dict with intent summary, total_found count, and the full list of
+        matching tracks with metadata and Essentia audio features.
+    """
+    await _ensure_initialized()
+
+    intent = _parse_set_intent(prompt, attrs=library_attributes)
+
+    resolved_genre = genre or intent["genre"]
+    resolved_bpm_min = bpm_min or intent["bpm_min"]
+    resolved_bpm_max = bpm_max or intent["bpm_max"]
+    resolved_my_tags = my_tags or intent["my_tags"]
+
+    limit = max(1, min(500, limit))
+
+    # --- Query library index for tracks matching each detected My Tag ---
+    candidate_ids: set = set()
+    tag_coverage: Dict[str, int] = {}
+    tag_match_count: Dict[str, int] = {}  # track_id → how many tags it matched
+
+    if library_index is not None and resolved_my_tags:
+        for tag in resolved_my_tags:
+            matches = library_index.search(my_tag=tag, limit=500)
+            tag_coverage[tag] = len(matches)
+            for rec in matches:
+                tid = rec["id"]
+                candidate_ids.add(tid)
+                tag_match_count[tid] = tag_match_count.get(tid, 0) + 1
+
+    used_fallback = len(candidate_ids) < 10
+    if used_fallback:
+        candidate_tracks = list(engine.tracks)
+    else:
+        candidate_tracks = [t for t in engine.tracks if str(t.id) in candidate_ids]
+
+    # --- Apply BPM filter ---
+    if resolved_bpm_min or resolved_bpm_max:
+        bpm_lo = resolved_bpm_min or 0.0
+        bpm_hi = resolved_bpm_max or 9999.0
+        candidate_tracks = [
+            t for t in candidate_tracks
+            if t.bpm and bpm_lo <= t.bpm <= bpm_hi
+        ]
+
+    # --- Apply genre filter ---
+    if resolved_genre:
+        genre_lower = resolved_genre.lower()
+        candidate_tracks = [
+            t for t in candidate_tracks
+            if t.genre and genre_lower in t.genre.lower()
+        ]
+
+    # --- Sort: most tag matches first, then higher energy first ---
+    candidate_tracks.sort(key=lambda t: (-tag_match_count.get(str(t.id), 0), -(t.energy or 5)))
+
+    # --- Essentia enrichment ---
+    enrich_store = (
+        LibraryIndexFeatureStore(library_index)
+        if library_index is not None and len(library_index._by_id) > 0
+        else engine.essentia_store
+    )
+
+    def _ess(file_path: Optional[str]) -> Dict:
+        if not enrich_store or not file_path:
+            return {}
+        ess = enrich_store.get(file_path)
+        if not ess:
+            return {}
+
+        out: Dict = {
+            "essentia_energy": ess.energy_as_1_to_10(),
+            "danceability": ess.danceability_as_1_to_10(),
+            "lufs": round(ess.integrated_lufs, 1),
+        }
+
+        mood: Dict = {}
+        for key, val in [
+            ("happy",      ess.mood_happy),
+            ("sad",        ess.mood_sad),
+            ("aggressive", ess.mood_aggressive),
+            ("relaxed",    ess.mood_relaxed),
+            ("party",      ess.mood_party),
+        ]:
+            if val is not None:
+                mood[key] = round(val, 2)
+        if mood:
+            out["mood"] = mood
+            out["dominant_mood"] = max(mood, key=mood.get)
+
+        if ess.genre_discogs:
+            sorted_genres = sorted(ess.genre_discogs.items(), key=lambda x: x[1], reverse=True)
+            out["top_genres"] = {g: round(s, 3) for g, s in sorted_genres[:3]}
+            out["top_genre_discogs"] = sorted_genres[0][0] if sorted_genres else None
+
+        if ess.music_tags:
+            sorted_tags = sorted(ess.music_tags, key=lambda t: t["score"], reverse=True)
+            out["top_tags"] = {t["tag"]: round(t["score"], 3) for t in sorted_tags[:5]}
+
+        return out
+
+    total_found = len(candidate_tracks)
+
+    return {
+        "prompt": prompt,
+        "intent": {
+            "my_tags_detected": resolved_my_tags or [],
+            "tag_coverage": tag_coverage,
+            "candidate_pool": (
+                total_found
+                if not used_fallback
+                else f"{total_found} (all tracks — no My Tag matches, used genre/BPM fallback)"
+            ),
+            "genre": resolved_genre,
+            "bpm_range": (
+                f"{resolved_bpm_min:.0f}–{resolved_bpm_max:.0f}"
+                if resolved_bpm_min and resolved_bpm_max
+                else None
+            ),
+            "reasoning": intent["reasoning"],
+        },
+        "total_found": total_found,
+        "returned": min(total_found, limit),
+        "tracks": [
+            {
+                "artist": t.artist,
+                "title": t.title,
+                "bpm": t.bpm,
+                "key": t.key,
+                "energy": t.energy,
+                "genre": t.genre,
+                "my_tags": t.my_tags,
+                "duration": t.duration_formatted(),
+                "tag_matches": tag_match_count.get(str(t.id), 0),
+                **_ess(t.file_path),
+            }
+            for t in candidate_tracks[:limit]
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Library index tools
 # ---------------------------------------------------------------------------

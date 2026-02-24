@@ -3,17 +3,29 @@ description: Build a DJ set from a natural language prompt using your Rekordbox 
 argument-hint: "e.g. 60min sunset progressive house, afters techno 2hrs, festival main stage with vocals"
 ---
 
-Build a DJ set from this prompt: **$ARGUMENTS**
+Prompt: **$ARGUMENTS**
 
 Follow these steps exactly:
 
-## Step 1 — Parse and build the set
+## Step 1 — Ask what the user wants
+
+Before calling any tool, output this question and wait for the user's reply:
+
+> **"$ARGUMENTS"**
+>
+> What would you like to do?
+> - **Build a set** — generate a curated, harmonically-ordered setlist ready to play
+> - **Find matching tracks** — explore every track in your library that fits this vibe
+
+Then proceed to Step 2A or Step 2B based on their choice.
+
+---
+
+## Step 2A — Build the set
 
 Call `mcp__mcp-dj__build_set_from_prompt` with:
 - `prompt`: the full user prompt (everything in $ARGUMENTS)
 - `duration_minutes`: extract from the prompt if mentioned (e.g. "2 hour" → 120, "90 min" → 90), otherwise use 60
-
-## Step 2 — Present the setlist
 
 Format the result as a clean DJ-readable setlist. Use this exact layout:
 
@@ -43,8 +55,6 @@ Below the table show:
 
 ---
 
-## Step 3 — Offer export and follow-up actions
-
 After presenting the set, ask:
 
 > **What next?**
@@ -56,11 +66,52 @@ After presenting the set, ask:
 
 If the user says anything matching export/save/rekordbox, immediately call `mcp__mcp-dj__export_setlist_to_rekordbox` with the `setlist_id` from the result and the playlist name they provided (default: the set name).
 
+---
+
+## Step 2B — Find matching tracks
+
+Call `mcp__mcp-dj__find_tracks_for_prompt` with:
+- `prompt`: the full user prompt (everything in $ARGUMENTS)
+- `limit`: 100
+
+Format the result like this:
+
+---
+
+### 🔍 Tracks matching "$ARGUMENTS"
+
+**Intent detected**
+- Tags: [my_tags_detected joined with " · ", or "none — genre/BPM fallback used" if empty]
+- Genre: [genre or "mixed"] · BPM: [bpm_range] · Pool: [candidate_pool] tracks
+- Reasoning: *[reasoning string]*
+
+---
+
+**[total_found] tracks found** (showing [returned])
+
+| # | Artist – Title | BPM | Key | Energy | Tags matched | Duration |
+|---|---------------|-----|-----|--------|--------------|----------|
+
+Fill each row from the `tracks` array. `tag_matches` goes in the "Tags matched" column — show it as a count (e.g. `2`) only when > 0, otherwise leave blank. Sort is already by relevance (most tag matches first, then energy).
+
+Include `dominant_mood` or `top_genre_discogs` as a subtle note in the Artist–Title cell if present, e.g. "Artist – Title *(dark, electronic)*".
+
+---
+
+After presenting the tracks, ask:
+
+> **What next?**
+> - **Build a set from these** — say "build a set from these" to run `/build-set` with the same prompt
+> - **Filter further** — say "only show tracks above energy 7" or "filter to just techno"
+> - **Explore a track** — say "tell me more about [title]" to get full track details
+
+---
+
 ## Rules
 
-- Always show the full tracklist table — never truncate it
-- If `my_tags_detected` is empty, note that the set used genre/BPM filtering from the full library and suggest adding MyTags in Rekordbox for better curation
-- If `harmonic_score` is below 6.0, add a note: "⚠ Harmonic score is low — consider using `/build-set` with a more specific genre or BPM range for tighter key compatibility"
+- Always show the full track table — never truncate it
+- If `my_tags_detected` is empty, note that results used genre/BPM filtering from the full library and suggest adding MyTags in Rekordbox for better curation
+- If `harmonic_score` is below 6.0 (Step 2A only), add a note: "⚠ Harmonic score is low — consider using `/build-set` with a more specific genre or BPM range for tighter key compatibility"
 - Format BPM values as integers (no decimals)
 - Format energy as filled circles: ●●●●●○○○○○ (filled = energy level out of 10)
 - The energy sparkline maps energy 1=▁ 2=▂ 3=▃ 4=▄ 5=▅ 6=▆ 7=▇ 8-10=█
