@@ -36,7 +36,13 @@ from .energy import MixedInKeyLibrary, EnergyResolver
 from .camelot import CamelotWheel
 from .energy_planner import EnergyPlanner, ENERGY_PROFILES
 from .setlist_engine import SetlistEngine
-from .models import SetlistRequest
+from .models import (
+    SetlistRequest,
+    EnergyCurvePoint,
+    GenrePhase,
+    BpmCurvePoint,
+    MoodTarget,
+)
 from .library_index import LibraryIndex, LibraryIndexFeatureStore
 from .intent import (
     VIBE_PROFILES as _VIBE_PROFILES,
@@ -1805,79 +1811,176 @@ async def analyze_library_essentia(
 async def build_set_from_prompt(
     prompt: str,
     duration_minutes: int = 60,
+    energy_curve: Optional[List[Dict[str, Any]]] = None,
+    genre_phases: Optional[List[Dict[str, Any]]] = None,
+    bpm_curve: Optional[List[Dict[str, Any]]] = None,
+    mood_target: Optional[Dict[str, Any]] = None,
+    my_tags: Optional[List[str]] = None,
+    genre: Optional[str] = None,
+    bpm_min: Optional[float] = None,
+    bpm_max: Optional[float] = None,
+    starting_track_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build a complete DJ set from a single free-form natural language prompt.
+    Build a complete DJ set from a natural language prompt with optional
+    LLM-generated structured parameters.
 
-    Queries the centralized library index (Rekordbox + Essentia + MIK data) using
-    your Rekordbox My Tags, then applies harmonic mixing (Camelot wheel) and energy
-    arc planning to produce a fully ordered setlist.
+    YOU (the LLM) SHOULD ALWAYS generate structured parameters alongside
+    the prompt to get the best results. Here is what you should provide:
 
-    Flow:
-        1. Parse prompt → extract My Tags, genre, BPM range, energy arc
-        2. Filter candidate tracks via My Tag matches in the library index
-        3. Run SetlistEngine on those candidates (harmonic + energy ordering)
-        4. Return track list with transition notes and full intent breakdown
+    1. **energy_curve** — ALWAYS generate this. A list of energy points that
+       define the energy arc for the set. Each point has ``position`` (0.0-1.0)
+       and ``energy`` (1-10). Minimum 2 points. Think about the DJ situation:
+       warm-up sets start low and build; peak-time sets stay high; closing sets
+       peak then descend; afterhours sets are a slow burn. Design the curve to
+       match the vibe the user describes.
 
-    Examples::
+       Example for a warm-up set:
+       [{"position": 0.0, "energy": 3}, {"position": 0.3, "energy": 4},
+        {"position": 0.6, "energy": 6}, {"position": 0.85, "energy": 7},
+        {"position": 1.0, "energy": 8}]
 
-        "60 minute progressive house sunset set"
-        "dark underground techno bangers for afters, build to peak"
-        "festival main stage with famous EDM and vocals, 90 minutes"
-        "2 hour warm-up set, start chill then build through house bangers"
-        "rooftop housy set, high energy, no need for vocals"
-        "wedding set — happy, famous, danceable tracks"
+    2. **genre_phases** — Generate when the user wants mixed genres or genre
+       transitions. Each phase has ``start``, ``end`` (0.0-1.0), ``genre``
+       (string), and optional ``weight`` (0.0-1.0, how strictly to enforce).
+
+       Example: "start deep house, transition to techno"
+       [{"start": 0.0, "end": 0.4, "genre": "Deep House", "weight": 0.8},
+        {"start": 0.3, "end": 0.7, "genre": "Tech House", "weight": 0.6},
+        {"start": 0.6, "end": 1.0, "genre": "Techno", "weight": 0.8}]
+
+    3. **bpm_curve** — Generate when BPM progression matters. Each point has
+       ``position`` (0.0-1.0) and ``bpm`` (60-200).
+
+       Example: gradual BPM build
+       [{"position": 0.0, "bpm": 120}, {"position": 0.5, "bpm": 126},
+        {"position": 1.0, "bpm": 132}]
+
+    4. **mood_target** — Generate when the user describes a mood or vibe.
+       Has ``moods`` dict (happy/sad/aggressive/relaxed/party, each 0.0-1.0)
+       and ``descriptors`` list (freeform: dark, hypnotic, uplifting, emotional,
+       driving, euphoric, melodic, groovy, raw, atmospheric, etc.).
+
+       Example: "dark underground techno"
+       {"moods": {"aggressive": 0.6, "party": 0.4}, "descriptors": ["dark", "driving", "hypnotic"]}
+
+    5. **my_tags** — Rekordbox My Tag names to filter candidates. Use exact
+       tag names from the library. Call get_library_attributes first if unsure.
+
+    6. **genre**, **bpm_min**, **bpm_max** — Simple overrides. Use genre_phases
+       instead for mixed-genre sets.
+
+    7. **starting_track_title** — Title of the track to start with.
+
+    The algorithm uses ALL available metadata for scoring: harmonic compatibility,
+    energy (MIK/Essentia/inferred), BPM, genre (Discogs + Rekordbox), mood vectors,
+    danceability, music tags, My Tags, color labels, loudness range, artist diversity,
+    rating, and play count.
 
     Args:
         prompt:           Natural language description of the set you want.
         duration_minutes: Fallback duration in minutes. Overridden if the prompt
                          contains an explicit duration (e.g. "2 hour", "90 min").
+        energy_curve:     Custom energy curve points (see above).
+        genre_phases:     Genre targets at different set positions (see above).
+        bpm_curve:        BPM progression curve (see above).
+        mood_target:      Target mood characteristics (see above).
+        my_tags:          Rekordbox My Tag names to filter candidates.
+        genre:            Single genre filter (use genre_phases for mixed genres).
+        bpm_min:          Minimum BPM filter.
+        bpm_max:          Maximum BPM filter.
+        starting_track_title: Title of track to start the set with.
 
     Returns:
-        Setlist in the same format as generate_setlist, plus an ``intent`` block
-        explaining which My Tags were detected, how many candidates matched, and
-        the full reasoning chain.
+        Setlist with track list, energy arc, harmonic score, and intent breakdown.
     """
     await _ensure_initialized()
 
-    # 1. Parse intent — fully dynamic using scanned library attributes
+    # --- Convert dicts to Pydantic models ---
+    energy_curve_models = None
+    if energy_curve:
+        try:
+            energy_curve_models = [EnergyCurvePoint(**pt) for pt in energy_curve]
+        except Exception as e:
+            logger.warning(f"Invalid energy_curve, ignoring: {e}")
+
+    genre_phases_models = None
+    if genre_phases:
+        try:
+            genre_phases_models = [GenrePhase(**gp) for gp in genre_phases]
+        except Exception as e:
+            logger.warning(f"Invalid genre_phases, ignoring: {e}")
+
+    bpm_curve_models = None
+    if bpm_curve:
+        try:
+            bpm_curve_models = [BpmCurvePoint(**bp) for bp in bpm_curve]
+        except Exception as e:
+            logger.warning(f"Invalid bpm_curve, ignoring: {e}")
+
+    mood_target_model = None
+    if mood_target:
+        try:
+            mood_target_model = MoodTarget(**mood_target)
+        except Exception as e:
+            logger.warning(f"Invalid mood_target, ignoring: {e}")
+
+    # --- Determine parameters: structured params first, fallback to intent parsing ---
+    has_structured = bool(energy_curve_models or genre_phases_models or bpm_curve_models
+                         or mood_target_model or my_tags or genre or bpm_min or bpm_max)
+
+    # Always parse intent for duration extraction and reasoning context
     intent = _parse_set_intent(prompt, attrs=library_attributes)
     if intent["duration_minutes"]:
         duration_minutes = intent["duration_minutes"]
     duration_minutes = max(10, min(480, duration_minutes))
 
-    # 2. Query library index for tracks matching detected My Tags
+    # Resolve final parameters — structured overrides intent-parsed values
+    resolved_genre = genre or (intent["genre"] if not genre_phases_models else None)
+    resolved_bpm_min = bpm_min or intent["bpm_min"]
+    resolved_bpm_max = bpm_max or intent["bpm_max"]
+    resolved_my_tags = my_tags or intent["my_tags"]
+    resolved_energy_profile = (
+        intent["energy_profile"]
+        if intent["energy_profile"] in ENERGY_PROFILES
+        else "journey"
+    )
+
+    # Find starting track by title
+    starting_track_id = None
+    if starting_track_title:
+        for t in engine.tracks:
+            if starting_track_title.lower() in t.title.lower():
+                starting_track_id = t.id
+                break
+
+    # --- Query library index for tracks matching My Tags ---
     candidate_ids: set = set()
     tag_coverage: Dict[str, int] = {}
 
-    if library_index is not None and intent["my_tags"]:
-        for tag in intent["my_tags"]:
+    if library_index is not None and resolved_my_tags:
+        for tag in resolved_my_tags:
             matches = library_index.search(my_tag=tag, limit=500)
             tag_coverage[tag] = len(matches)
             for rec in matches:
                 candidate_ids.add(rec["id"])
 
-    # 3. Map candidate IDs → TrackWithEnergy objects
+    # Map candidate IDs → TrackWithEnergy objects
     if candidate_ids:
         candidate_tracks = [t for t in engine.tracks if str(t.id) in candidate_ids]
     else:
         candidate_tracks = []
 
     # Fallback: if too few MyTag matches, widen to all tracks
-    # (SetlistEngine will still filter by genre/BPM)
     used_fallback = len(candidate_tracks) < 10
     if used_fallback:
         candidate_tracks = engine.tracks
 
-    # 4. Build a temporary engine scoped to the candidate pool
+    # --- Build a temporary engine scoped to the candidate pool ---
     from .setlist_engine import SetlistEngine as _SetlistEngine
     from .camelot import CamelotWheel as _CamelotWheel
     from .energy_planner import EnergyPlanner as _EnergyPlanner
 
-    # Prefer the library index as the feature source — it holds the full
-    # mood / genre / tags vectors in-memory (already loaded from JSONL) and
-    # requires no extra disk I/O.  Fall back to engine.essentia_store for any
-    # tracks analyzed after the last index build.
     ess_store = (
         LibraryIndexFeatureStore(library_index)
         if library_index is not None and len(library_index._by_id) > 0
@@ -1891,32 +1994,37 @@ async def build_set_from_prompt(
         essentia_store=ess_store,
     )
 
-    # 5. Generate setlist
+    # --- Build SetlistRequest with all structured params ---
     request = SetlistRequest(
         prompt=prompt,
         duration_minutes=duration_minutes,
-        genre=intent["genre"],
-        bpm_min=intent["bpm_min"],
-        bpm_max=intent["bpm_max"],
-        energy_profile=(
-            intent["energy_profile"]
-            if intent["energy_profile"] in ENERGY_PROFILES
-            else "journey"
-        ),
+        genre=resolved_genre,
+        bpm_min=resolved_bpm_min,
+        bpm_max=resolved_bpm_max,
+        energy_profile=resolved_energy_profile,
+        starting_track_id=starting_track_id,
+        energy_curve=energy_curve_models,
+        genre_phases=genre_phases_models,
+        bpm_curve=bpm_curve_models,
+        mood_target=mood_target_model,
+        my_tags=resolved_my_tags or [],
     )
     setlist = temp_engine.generate_setlist(request)
 
-    # 6. Register setlist in the main engine so export_setlist_to_rekordbox works
+    # Register setlist in the main engine so export_setlist_to_rekordbox works
     engine._setlists[setlist.id] = setlist
 
-    # 7. Essentia enrichment per track — expose mood vector, Discogs genres,
-    #    and music tags so the caller can see the full feature set used during scoring.
-    ess_store = engine.essentia_store
+    # --- Essentia enrichment per track ---
+    enrich_store = (
+        LibraryIndexFeatureStore(library_index)
+        if library_index is not None and len(library_index._by_id) > 0
+        else engine.essentia_store
+    )
 
     def _ess(file_path: Optional[str]) -> Dict:
-        if not ess_store or not file_path:
+        if not enrich_store or not file_path:
             return {}
-        ess = ess_store.get(file_path)
+        ess = enrich_store.get(file_path)
         if not ess:
             return {}
 
@@ -1926,7 +2034,6 @@ async def build_set_from_prompt(
             "lufs": round(ess.integrated_lufs, 1),
         }
 
-        # Full mood probability vector
         mood: Dict = {}
         for key, val in [
             ("happy",      ess.mood_happy),
@@ -1941,7 +2048,6 @@ async def build_set_from_prompt(
             out["mood"] = mood
             out["dominant_mood"] = max(mood, key=mood.get)
 
-        # Top-3 Discogs genres (already stripped of "Electronic---" prefix)
         if ess.genre_discogs:
             sorted_genres = sorted(
                 ess.genre_discogs.items(), key=lambda x: x[1], reverse=True
@@ -1949,30 +2055,50 @@ async def build_set_from_prompt(
             out["top_genres"] = {g: round(s, 3) for g, s in sorted_genres[:3]}
             out["top_genre_discogs"] = sorted_genres[0][0] if sorted_genres else None
 
-        # Top-5 music tags
         if ess.music_tags:
             sorted_tags = sorted(ess.music_tags, key=lambda t: t["score"], reverse=True)
             out["top_tags"] = {t["tag"]: round(t["score"], 3) for t in sorted_tags[:5]}
 
         return out
 
+    # --- Build intent summary for the response ---
+    intent_summary: Dict[str, Any] = {
+        "my_tags_detected": resolved_my_tags or [],
+        "tag_coverage": tag_coverage,
+        "candidate_pool": (
+            len(candidate_tracks)
+            if not used_fallback
+            else f"{len(candidate_tracks)} (all tracks — no My Tag matches, used genre/BPM fallback)"
+        ),
+        "genre": resolved_genre,
+        "bpm_range": f"{resolved_bpm_min:.0f}–{resolved_bpm_max:.0f}" if resolved_bpm_min and resolved_bpm_max else None,
+        "reasoning": intent["reasoning"],
+        "structured_params_provided": has_structured,
+    }
+    if energy_curve_models:
+        intent_summary["energy_curve"] = [
+            {"position": p.position, "energy": p.energy} for p in energy_curve_models
+        ]
+    if genre_phases_models:
+        intent_summary["genre_phases"] = [
+            {"start": gp.start, "end": gp.end, "genre": gp.genre, "weight": gp.weight}
+            for gp in genre_phases_models
+        ]
+    if bpm_curve_models:
+        intent_summary["bpm_curve"] = [
+            {"position": bp.position, "bpm": bp.bpm} for bp in bpm_curve_models
+        ]
+    if mood_target_model:
+        intent_summary["mood_target"] = {
+            "moods": mood_target_model.moods,
+            "descriptors": mood_target_model.descriptors,
+        }
+
     return {
         "setlist_id": setlist.id,
         "name": setlist.name,
         "prompt": prompt,
-        "intent": {
-            "my_tags_detected": intent["my_tags"],
-            "tag_coverage": tag_coverage,
-            "candidate_pool": (
-                len(candidate_tracks)
-                if not used_fallback
-                else f"{len(candidate_tracks)} (all tracks — no My Tag matches, used genre/BPM fallback)"
-            ),
-            "genre": intent["genre"],
-            "bpm_range": f"{intent['bpm_min']:.0f}–{intent['bpm_max']:.0f}",
-            "energy_profile": intent["energy_profile"],
-            "reasoning": intent["reasoning"],
-        },
+        "intent": intent_summary,
         "track_count": setlist.track_count,
         "duration_minutes": round(setlist.total_duration_seconds / 60),
         "avg_bpm": setlist.avg_bpm,
