@@ -76,6 +76,7 @@ def render_html(setlist: Dict[str, Any]) -> str:
 
     energy_svg = _energy_arc_svg(energy_arc)
     track_cards = "\n".join(_track_card(t, i, len(tracks)) for i, t in enumerate(tracks))
+    scatter_html = _scatter_section(tracks)
     intent_html = _intent_section(intent)
     genre_pills = _genre_pills(genre_dist)
     harmonic_class = "score-good" if harmonic >= 0.75 else "score-ok" if harmonic >= 0.55 else "score-warn"
@@ -120,6 +121,9 @@ def render_html(setlist: Dict[str, Any]) -> str:
     <div class="section-label">ENERGY ARC</div>
     {energy_svg}
   </section>
+
+  <!-- ── 2D TRACK MAP ── -->
+  {scatter_html}
 
   <!-- ── FLOW DIAGRAM ── -->
   <section class="flow-section">
@@ -443,6 +447,247 @@ def _slugify(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 2D track map (PCA projection)
+# ---------------------------------------------------------------------------
+
+_FEAT_NAMES = ["BPM", "Energy", "Dance", "Loud", "Happy", "Sad", "Aggr", "Relaxed", "Party"]
+
+
+def _compute_2d_projection(tracks: List[Dict[str, Any]]):
+    """
+    Project tracks to 2D via PCA on acoustic features.
+
+    Returns (xs, ys, feat_names, pc1_loadings, pc2_loadings, var_pc1, var_pc2).
+    Falls back to a simple 2-feature projection if numpy is unavailable.
+    """
+    try:
+        import numpy as np
+
+        rows = []
+        for t in tracks:
+            bpm = float(t.get("bpm") or 125)
+            energy = float(t.get("energy") or t.get("essentia_energy") or 5)
+            dance = float(t.get("danceability") or 5)
+            lufs = float(t.get("lufs") or -10.0)
+            mood = t.get("mood") or {}
+            rows.append([
+                (bpm - 110) / 40,           # BPM centred ~130
+                (energy - 5) / 4,           # Energy 1-10
+                (dance - 5) / 4,            # Danceability 1-10
+                (lufs + 12) / 8,            # LUFS — louder ↑
+                float(mood.get("happy", 0.25)),
+                float(mood.get("sad", 0.5)),
+                float(mood.get("aggressive", 0.4)),
+                float(mood.get("relaxed", 0.6)),
+                float(mood.get("party", 0.2)),
+            ])
+
+        X = np.array(rows, dtype=float)
+        X -= X.mean(axis=0)
+
+        if len(X) < 2:
+            return [0.0], [0.0], _FEAT_NAMES, [1] + [0] * 8, [0, 1] + [0] * 7, 0.5, 0.3
+
+        cov = np.cov(X.T)
+        vals, vecs = np.linalg.eigh(cov)
+        idx = np.argsort(vals)[::-1]
+        vecs = vecs[:, idx]
+        vals = vals[idx]
+
+        projected = X @ vecs[:, :2]
+        total_var = float(vals.sum()) or 1.0
+        var_pc1 = float(vals[0]) / total_var
+        var_pc2 = float(vals[1]) / total_var
+
+        return (
+            projected[:, 0].tolist(),
+            projected[:, 1].tolist(),
+            _FEAT_NAMES,
+            vecs[:, 0].tolist(),
+            vecs[:, 1].tolist(),
+            var_pc1,
+            var_pc2,
+        )
+
+    except Exception:
+        # Simple fallback: BPM vs (aggressive - relaxed)
+        xs = [(float(t.get("bpm") or 125) - 110) / 40 for t in tracks]
+        ys = [
+            float((t.get("mood") or {}).get("aggressive", 0.3))
+            - float((t.get("mood") or {}).get("relaxed", 0.3))
+            for t in tracks
+        ]
+        return xs, ys, _FEAT_NAMES, [1] + [0] * 8, [0] * 6 + [1, -1, 0], 0.4, 0.2
+
+
+def _axis_label(feat_names: List[str], loadings: List[float], var: float) -> str:
+    """Describe a PCA axis in human-readable terms using top positive/negative loadings."""
+    if not feat_names or not loadings:
+        return "Component"
+    pairs = sorted(zip(loadings, feat_names), key=lambda x: -abs(x[0]))
+    top_pos = [n for v, n in pairs if v > 0][:2]
+    top_neg = [n for v, n in pairs if v < 0][:2]
+    pos_str = " + ".join(top_pos) if top_pos else "—"
+    neg_str = " + ".join(top_neg) if top_neg else "—"
+    return f"{neg_str}  ←→  {pos_str}   ({var:.0%} var)"
+
+
+def _scatter_section(tracks: List[Dict[str, Any]]) -> str:
+    """Render the 2D acoustic map section as an SVG with interactive tooltips."""
+    if len(tracks) < 2:
+        return ""
+
+    result = _compute_2d_projection(tracks)
+    xs, ys = result[0], result[1]
+    feat_names = result[2] if len(result) > 2 else _FEAT_NAMES
+    pc1_load = result[3] if len(result) > 3 else []
+    pc2_load = result[4] if len(result) > 4 else []
+    var1 = result[5] if len(result) > 5 else 0.0
+    var2 = result[6] if len(result) > 6 else 0.0
+
+    W, H, PAD = 860, 500, 70
+
+    # Normalise to SVG viewport with margin
+    margin = 0.12
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    xr = max(x_max - x_min, 1e-6)
+    yr = max(y_max - y_min, 1e-6)
+    x_min -= xr * margin; x_max += xr * margin
+    y_min -= yr * margin; y_max += yr * margin
+    xr = x_max - x_min
+    yr = y_max - y_min
+
+    def to_svg(xi: float, yi: float):
+        sx = PAD + (xi - x_min) / xr * (W - 2 * PAD)
+        sy = H - PAD - (yi - y_min) / yr * (H - 2 * PAD)
+        return round(sx, 1), round(sy, 1)
+
+    svg_pts = [to_svg(x, y) for x, y in zip(xs, ys)]
+
+    # ── Soft grid (faint lines at 25/50/75% across each axis) ──
+    grid_lines = ""
+    for frac in (0.25, 0.5, 0.75):
+        gx = PAD + frac * (W - 2 * PAD)
+        gy = H - PAD - frac * (H - 2 * PAD)
+        grid_lines += (
+            f'<line x1="{gx:.1f}" y1="{PAD}" x2="{gx:.1f}" y2="{H-PAD}" class="sc-grid"/>'
+            f'<line x1="{PAD}" y1="{gy:.1f}" x2="{W-PAD}" y2="{gy:.1f}" class="sc-grid"/>'
+        )
+
+    # ── Set-order path (curved polyline) ──
+    if len(svg_pts) >= 2:
+        path_d = f"M{svg_pts[0][0]},{svg_pts[0][1]}"
+        for i in range(1, len(svg_pts)):
+            cx = (svg_pts[i-1][0] + svg_pts[i][0]) / 2
+            path_d += (
+                f" C{cx:.1f},{svg_pts[i-1][1]:.1f}"
+                f" {cx:.1f},{svg_pts[i][1]:.1f}"
+                f" {svg_pts[i][0]:.1f},{svg_pts[i][1]:.1f}"
+            )
+        set_path = f'<path d="{path_d}" class="sc-path" fill="none"/>'
+    else:
+        set_path = ""
+
+    # ── Arrowheads at midpoints ──
+    arrows = ""
+    for i in range(len(svg_pts) - 1):
+        x1, y1 = svg_pts[i]
+        x2, y2 = svg_pts[i + 1]
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        arrows += (
+            f'<text x="{mx:.1f}" y="{my:.1f}" class="sc-arrow"'
+            f' transform="rotate({angle:.0f},{mx:.1f},{my:.1f})"'
+            f' text-anchor="middle" dominant-baseline="central">›</text>'
+        )
+
+    # ── Dots + position labels ──
+    dots = ""
+    for i, t in enumerate(tracks):
+        sx, sy = svg_pts[i]
+        key = t.get("key", "")
+        energy = int(t.get("energy") or t.get("essentia_energy") or 5)
+        kc = _KEY_COLORS.get(key, "#6060a0")
+        r = round(7 + energy * 1.1, 1)
+        pos = t.get("position", i + 1)
+
+        # Escape data attrs
+        da = _esc(t.get("artist", ""))
+        dt = _esc(t.get("title", ""))
+        dk = _esc(key)
+        db = f'{float(t.get("bpm") or 0):.0f}'
+        de = str(energy)
+        dd = _esc(t.get("dominant_mood", ""))
+        dtags = _esc(", ".join((t.get("my_tags") or [])[:4]))
+        drel = _esc(t.get("key_relation", ""))
+        dscore = f'{float(t.get("transition_score") or 0):.0%}'
+
+        dots += (
+            f'<circle cx="{sx}" cy="{sy}" r="{r}" class="sc-dot"'
+            f' style="fill:{kc};fill-opacity:0.82;stroke:#0a0a0f;stroke-width:2"'
+            f' data-pos="{pos}" data-artist="{da}" data-title="{dt}"'
+            f' data-key="{dk}" data-bpm="{db}" data-energy="{de}"'
+            f' data-mood="{dd}" data-tags="{dtags}"'
+            f' data-rel="{drel}" data-score="{dscore}"'
+            f' onclick="scatterClick({pos})"/>'
+        )
+        # Position number (white text inside dot)
+        dots += (
+            f'<text x="{sx}" y="{sy}" class="sc-num"'
+            f' text-anchor="middle" dominant-baseline="central"'
+            f' style="pointer-events:none">{pos}</text>'
+        )
+
+    # ── Axis labels ──
+    x_lbl = _axis_label(feat_names, pc1_load, var1)
+    y_lbl = _axis_label(feat_names, pc2_load, var2)
+    cx = (PAD + W - PAD) / 2
+    cy = (PAD + H - PAD) / 2
+    axis_markup = (
+        f'<text x="{cx:.0f}" y="{H - 6}" class="sc-axis-lbl" text-anchor="middle">'
+        f'PC1  {_esc(x_lbl)}</text>'
+        f'<text x="12" y="{cy:.0f}" class="sc-axis-lbl" text-anchor="middle"'
+        f' transform="rotate(-90,12,{cy:.0f})">PC2  {_esc(y_lbl)}</text>'
+    )
+
+    # ── Key-color legend ──
+    keys_used = sorted(set(t.get("key", "") for t in tracks if t.get("key")))
+    legend_items = "".join(
+        f'<span class="sc-leg-item">'
+        f'<svg width="12" height="12" style="display:inline-block;vertical-align:middle;margin-right:3px">'
+        f'<circle cx="6" cy="6" r="5" fill="{_KEY_COLORS.get(k, "#888")}"/></svg>'
+        f'{_esc(k)}</span>'
+        for k in keys_used
+    )
+
+    return f"""<section class="scatter-section">
+    <div class="section-label" onclick="toggleSection(this)">2D TRACK MAP <span class="expand-icon small">▸</span></div>
+    <div class="scatter-body open">
+      <p class="scatter-sub">Acoustic similarity projection (PCA) — dot size = energy · color = Camelot key · dashed curve = set play order<br>
+      Click a dot or an energy-arc point to jump to that track card below.</p>
+      <div class="sc-legend">{legend_items}</div>
+      <div class="sc-wrap">
+        <svg viewBox="0 0 {W} {H}" class="sc-svg" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <filter id="glow">
+              <feGaussianBlur stdDeviation="3" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+          {grid_lines}
+          {set_path}
+          {arrows}
+          {dots}
+          {axis_markup}
+        </svg>
+        <div id="sc-tip" class="sc-tooltip"></div>
+      </div>
+    </div>
+  </section>"""
+
+
+# ---------------------------------------------------------------------------
 # CSS
 # ---------------------------------------------------------------------------
 
@@ -638,6 +883,38 @@ h1 { font-size: 26px; font-weight: 800; color: #f0f0ff; margin-bottom: 6px; }
   .card-header { gap: 8px; }
   .track-meta-row { gap: 5px; }
 }
+
+/* ── 2D SCATTER ── */
+.scatter-section { margin-bottom: 28px; }
+.scatter-body { display: none; }
+.scatter-body.open { display: block; }
+.scatter-sub { font-size: 12px; color: #4a4a6a; margin-bottom: 12px; line-height: 1.6; }
+.sc-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.sc-leg-item { font-size: 11px; color: #5a5a8a; display: flex; align-items: center; gap: 2px; }
+.sc-wrap { position: relative; }
+.sc-svg { width: 100%; height: auto; display: block; background: #0c0c18; border-radius: 10px; border: 1px solid #1a1a2a; }
+.sc-grid { stroke: #161624; stroke-width: 1; }
+.sc-path { stroke: #3b3b6a; stroke-width: 2; stroke-dasharray: 5 4; opacity: 0.6; }
+.sc-arrow { fill: #3b3b6a; font-size: 14px; opacity: 0.7; }
+.sc-dot { cursor: pointer; transition: r 0.15s, filter 0.15s; }
+.sc-dot:hover { filter: url(#glow); }
+.sc-num {
+  fill: #fff; font-size: 9px; font-weight: 800;
+  text-shadow: 0 0 3px #000;
+  pointer-events: none;
+}
+.sc-axis-lbl { fill: #2e2e4a; font-size: 10px; }
+.sc-tooltip {
+  display: none; position: absolute; z-index: 20;
+  background: #15152a; border: 1px solid #3030508a;
+  border-radius: 10px; padding: 10px 14px; min-width: 200px;
+  pointer-events: none; box-shadow: 0 4px 24px #00000088;
+}
+.sc-tip-pos  { font-size: 10px; color: #5050a0; font-weight: 700; letter-spacing: 2px; margin-bottom: 4px; }
+.sc-tip-name { font-size: 14px; color: #e0e0f0; font-weight: 600; margin-bottom: 6px; line-height: 1.3; }
+.sc-tip-row  { font-size: 11px; color: #6060a0; margin-bottom: 2px; }
+.sc-tip-row b { color: #9090c0; }
+.sc-tip-tags { font-size: 10px; color: #404068; margin-top: 5px; font-style: italic; }
 """
 
 # ---------------------------------------------------------------------------
@@ -693,4 +970,53 @@ document.querySelectorAll('.arc-dot').forEach(dot => {
     }
   });
 });
+
+// ── Scatter dot tooltips ──
+const scTip = document.getElementById('sc-tip');
+document.querySelectorAll('.sc-dot').forEach(dot => {
+  dot.addEventListener('mouseenter', () => {
+    const pos   = dot.dataset.pos;
+    const key   = dot.dataset.key;
+    const bpm   = dot.dataset.bpm;
+    const en    = dot.dataset.energy;
+    const mood  = dot.dataset.mood;
+    const rel   = dot.dataset.rel;
+    const score = dot.dataset.score;
+    const tags  = dot.dataset.tags;
+    scTip.innerHTML =
+      `<div class="sc-tip-pos">TRACK ${pos}</div>` +
+      `<div class="sc-tip-name">${dot.dataset.artist}<br><span style="color:#7070a0">${dot.dataset.title}</span></div>` +
+      `<div class="sc-tip-row">Key <b>${key}</b> · <b>${bpm} BPM</b> · Energy <b>${en}/10</b></div>` +
+      (mood  ? `<div class="sc-tip-row">Mood <b>${mood}</b></div>` : '') +
+      (rel && rel !== 'start' ? `<div class="sc-tip-row">Transition <b>${rel}</b> · match <b>${score}</b></div>` : '') +
+      (tags  ? `<div class="sc-tip-tags">${tags}</div>` : '');
+    scTip.style.display = 'block';
+  });
+  dot.addEventListener('mousemove', e => {
+    const wrap = dot.closest('.sc-wrap').getBoundingClientRect();
+    let lx = e.clientX - wrap.left + 16;
+    let ly = e.clientY - wrap.top  - 10;
+    // keep inside wrap
+    lx = Math.min(lx, wrap.width - 230);
+    ly = Math.max(ly, 4);
+    scTip.style.left = lx + 'px';
+    scTip.style.top  = ly + 'px';
+  });
+  dot.addEventListener('mouseleave', () => {
+    scTip.style.display = 'none';
+  });
+});
+
+// Click scatter dot → expand track card in flow
+function scatterClick(pos) {
+  const card = document.getElementById('track-' + pos);
+  if (!card) return;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const body = card.querySelector('.card-body');
+  const icon = card.querySelector('.expand-icon');
+  if (body && !body.classList.contains('open')) {
+    body.classList.add('open');
+    if (icon) icon.classList.add('open');
+  }
+}
 """

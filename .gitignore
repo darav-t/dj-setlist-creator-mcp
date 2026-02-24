@@ -66,3 +66,4 @@ Thumbs.db
 .data/library_attributes.json
 .data/library_context.md
 .data/dj_history/*
+.data/library_map.json

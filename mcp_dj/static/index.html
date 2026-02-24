@@ -371,6 +371,49 @@
     .toast.error { border-color: rgba(239,68,68,.4); color: var(--red); background: rgba(239,68,68,.1); }
     @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: none; } }
 
+    /* ── Track Map ────────────────────────────────────────────── */
+    .map-controls {
+      padding: 10px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+      flex-shrink: 0;
+    }
+    .map-mode-btns {
+      display: flex; gap: 3px;
+      background: var(--surface2); border-radius: var(--radius-sm); padding: 3px;
+    }
+    .map-mode-btn {
+      padding: 4px 12px; border-radius: 4px; border: none;
+      font-size: 12px; font-weight: 500; color: var(--text-muted);
+      background: transparent; cursor: pointer; transition: all .15s;
+    }
+    .map-mode-btn.active { background: var(--surface3); color: var(--text); }
+    .map-mode-btn:hover:not(.active) { color: var(--accent); }
+    .map-status { font-size: 12px; color: var(--text-dim); flex: 1; }
+    .map-canvas-wrap { flex: 1; position: relative; overflow: hidden; }
+    #map-canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    #map-canvas:active { cursor: grabbing; }
+    .map-tooltip {
+      display: none; position: absolute;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 12px;
+      pointer-events: none; z-index: 10; max-width: 230px;
+      box-shadow: 0 4px 20px rgba(0,0,0,.55);
+    }
+    .map-legend {
+      position: absolute; bottom: 16px; left: 16px;
+      background: rgba(24,24,28,.9); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 12px;
+      max-width: 155px; pointer-events: none;
+      backdrop-filter: blur(8px);
+    }
+    .map-empty {
+      position: absolute; inset: 0; display: flex;
+      align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+      background: var(--bg); color: var(--text-muted); font-size: 13px;
+    }
+
     /* ── Scrollbar ────────────────────────────────────────────── */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -474,6 +517,7 @@ Try asking me:
         <button class="viz-tab active" onclick="switchTab('setlist', this)">Setlist</button>
         <button class="viz-tab" onclick="switchTab('charts', this)">Charts</button>
         <button class="viz-tab" onclick="switchTab('recommendations', this)">Next Track</button>
+        <button class="viz-tab" onclick="switchTab('map', this)">🗺 Track Map</button>
       </div>
       <div class="viz-actions" id="viz-actions">
         <span id="setlist-name-label" style="font-size:13px;color:var(--text-muted);"></span>
@@ -513,6 +557,30 @@ Try asking me:
             <div class="chart-wrap" style="height:160px;">
               <canvas id="genre-chart"></canvas>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Map pane -->
+      <div class="pane" id="pane-map">
+        <div class="map-controls">
+          <div class="map-mode-btns">
+            <button class="map-mode-btn active" data-mode="energy" onclick="setMapColorMode('energy')">Energy</button>
+            <button class="map-mode-btn" data-mode="genre" onclick="setMapColorMode('genre')">Genre</button>
+            <button class="map-mode-btn" data-mode="bpm" onclick="setMapColorMode('bpm')">BPM</button>
+            <button class="map-mode-btn" data-mode="tags" onclick="setMapColorMode('tags')">Tags</button>
+          </div>
+          <span class="map-status" id="map-status"></span>
+          <button class="btn btn-ghost" style="font-size:12px;padding:4px 10px;" onclick="resetMapZoom()">⟳ Reset View</button>
+          <button class="btn btn-ghost" id="rebuild-map-btn" style="font-size:12px;padding:4px 10px;" onclick="rebuildTrackMap()" title="Recompute 2D positions from scratch">⚙ Rebuild Map</button>
+        </div>
+        <div class="map-canvas-wrap" id="map-canvas-wrap">
+          <canvas id="map-canvas"></canvas>
+          <div class="map-tooltip" id="map-tooltip"></div>
+          <div class="map-legend" id="map-legend"></div>
+          <div class="map-empty" id="map-loading">
+            <div class="typing-dots"><span></span><span></span><span></span></div>
+            <span>Computing track map…</span>
           </div>
         </div>
       </div>
@@ -571,7 +639,9 @@ const state = {
   energyDir: 'maintain',
   charts: { energy: null, bpm: null, genre: null },
   loading: false,
+  mapLoaded: false,
 };
+let trackMap = null;
 
 // ── API helpers ────────────────────────────────────────────────────────────
 async function api(path, options = {}) {
@@ -646,6 +716,7 @@ async function sendMessage() {
       switchTab('setlist', document.querySelector('.viz-tab'));
       renderCharts(data.setlist);
       document.getElementById('export-btn').disabled = false;
+      trackMap?.updateSet(data.setlist);
     }
     if (data.recommendations) {
       state.currentRecs = data.recommendations;
@@ -698,10 +769,10 @@ function switchTab(name, btn) {
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.viz-tab').forEach(t => t.classList.remove('active'));
   document.getElementById(`pane-${name}`).classList.add('active');
-  // find the clicked tab button
   const tabs = document.querySelectorAll('.viz-tab');
-  const idx = ['setlist', 'charts', 'recommendations'].indexOf(name);
+  const idx = ['setlist', 'charts', 'recommendations', 'map'].indexOf(name);
   if (tabs[idx]) tabs[idx].classList.add('active');
+  if (name === 'map') loadTrackMap();
 }
 
 // ── Setlist rendering ──────────────────────────────────────────────────────
@@ -1005,6 +1076,433 @@ function esc(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+// ── Track Map ──────────────────────────────────────────────────────────────
+
+class TrackMap {
+  constructor(canvas) {
+    this.canvas  = canvas;
+    this.ctx     = canvas.getContext('2d');
+    this.tracks  = [];
+    this.setIds  = {};          // trackId → set position number
+    this.tx = 0; this.ty = 0; this.scale = 1;
+    this.mode    = 'energy';    // 'energy' | 'genre' | 'bpm' | 'tags'
+    this.hovered = null;
+    this._drag   = null;
+    this._raf    = null;
+    this._gColors = {};
+    this._dpr    = window.devicePixelRatio || 1;
+    this._ro     = new ResizeObserver(() => this._resize());
+    this._ro.observe(canvas.parentElement);
+    this._bind();
+    this._resize();
+  }
+
+  // ── Public ─────────────────────────────────────────────────────────────
+  load(tracks) {
+    this.tracks = tracks;
+    this._buildGenreColors();
+    this.resetView();
+    this._draw();
+  }
+
+  updateSet(setlist) {
+    this.setIds = {};
+    (setlist?.tracks || []).forEach(st => {
+      if (st.track?.id) this.setIds[st.track.id] = st.position;
+    });
+    this._draw();
+  }
+
+  resetView() {
+    const w = this.canvas.width / this._dpr;
+    const h = this.canvas.height / this._dpr;
+    if (!this.tracks.length) {
+      this.scale = Math.min(w, h) * 0.44;
+      this.tx = w / 2;
+      this.ty = h / 2;
+    } else {
+      // Fit the actual data bounding box with padding
+      let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+      for (const t of this.tracks) {
+        if (t.x < xMin) xMin = t.x; if (t.x > xMax) xMax = t.x;
+        if (t.y < yMin) yMin = t.y; if (t.y > yMax) yMax = t.y;
+      }
+      const pad  = 0.08;
+      const xSpan = (xMax - xMin) * (1 + 2 * pad);
+      const ySpan = (yMax - yMin) * (1 + 2 * pad);
+      this.scale = Math.min(w / xSpan, h / ySpan);
+      this.tx = w / 2 - ((xMin + xMax) / 2) * this.scale;
+      this.ty = h / 2 - ((yMin + yMax) / 2) * this.scale;
+    }
+    this._draw();
+  }
+
+  setMode(mode) { this.mode = mode; this._draw(); }
+
+  destroy() { this._ro.disconnect(); cancelAnimationFrame(this._raf); }
+
+  // ── Internal ───────────────────────────────────────────────────────────
+  _resize() {
+    const wrap = this.canvas.parentElement;
+    const w = wrap.clientWidth, h = wrap.clientHeight, dpr = this._dpr;
+    this.canvas.width  = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width  = w + 'px';
+    this.canvas.style.height = h + 'px';
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    this.resetView();
+  }
+
+  _buildGenreColors() {
+    const pal = [
+      '#8b5cf6','#3b82f6','#22c55e','#eab308','#f97316',
+      '#ef4444','#a78bfa','#60a5fa','#4ade80','#fbbf24',
+      '#fb923c','#f87171','#e879f9','#34d399','#818cf8',
+      '#c084fc','#38bdf8','#86efac','#fde68a','#fca5a5',
+    ];
+    const genres = [...new Set(this.tracks.map(t => t.genre || 'Other'))];
+    genres.forEach((g, i) => { this._gColors[g] = pal[i % pal.length]; });
+  }
+
+  _w2s(x, y) { return { sx: x * this.scale + this.tx, sy: y * this.scale + this.ty }; }
+  _s2w(sx, sy) { return { wx: (sx - this.tx) / this.scale, wy: (sy - this.ty) / this.scale }; }
+
+  _bind() {
+    const c = this.canvas;
+    c.addEventListener('wheel',      e => this._wheel(e), { passive: false });
+    c.addEventListener('mousedown',  e => this._down(e));
+    window.addEventListener('mousemove', e => this._move(e));
+    window.addEventListener('mouseup',   () => { this._drag = null; });
+    c.addEventListener('mouseleave', () => {
+      this.hovered = null;
+      document.getElementById('map-tooltip').style.display = 'none';
+      this._draw();
+    });
+  }
+
+  _wheel(e) {
+    e.preventDefault();
+    const rect = this.canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const { wx, wy } = this._s2w(mx, my);
+    const f = e.deltaY < 0 ? 1.12 : 0.89;
+    this.scale = Math.min(Math.max(this.scale * f, 50), 10000);
+    this.tx = mx - wx * this.scale;
+    this.ty = my - wy * this.scale;
+    this._draw();
+  }
+
+  _down(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    this._drag = {
+      mx0: e.clientX - rect.left, my0: e.clientY - rect.top,
+      tx0: this.tx, ty0: this.ty, rect,
+    };
+  }
+
+  _move(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+
+    if (this._drag) {
+      this.tx = this._drag.tx0 + (e.clientX - rect.left - this._drag.mx0);
+      this.ty = this._drag.ty0 + (e.clientY - rect.top  - this._drag.my0);
+      this._draw();
+      return;
+    }
+
+    // Only run hover when canvas is hovered
+    if (!this.canvas.matches(':hover')) return;
+
+    const { wx, wy } = this._s2w(mx, my);
+    const thresh = 14 / this.scale;
+    let best = null, bestD = thresh;
+    for (const t of this.tracks) {
+      const d = Math.hypot(t.x - wx, t.y - wy);
+      if (d < bestD) { bestD = d; best = t; }
+    }
+    if (best !== this.hovered) { this.hovered = best; this._draw(); }
+    this._tooltip(best, mx, my, rect);
+  }
+
+  _tooltip(t, mx, my, rect) {
+    const tip = document.getElementById('map-tooltip');
+    if (!t) { tip.style.display = 'none'; return; }
+    const tags  = (t.my_tags || []).slice(0, 3).join(', ');
+    const eC    = !t.energy ? 'mid' : t.energy <= 4 ? 'low' : t.energy <= 7 ? 'mid' : 'high';
+    tip.innerHTML = `
+      <div style="font-weight:700;font-size:13px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.title||'')}</div>
+      <div style="color:var(--text-muted);font-size:12px;margin-bottom:6px">${esc(t.artist||'')}</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        ${t.bpm    ? `<span class="pill pill-bpm">${Math.round(t.bpm)}</span>`                                               : ''}
+        ${t.key    ? `<span class="pill pill-key">${esc(t.key)}</span>`                                                      : ''}
+        ${t.energy ? `<span class="pill pill-energy ${eC}">E${t.energy}</span>`                                              : ''}
+        ${t.genre  ? `<span class="pill" style="background:var(--surface3);color:var(--text-muted);border:1px solid var(--border)">${esc(t.genre)}</span>` : ''}
+      </div>
+      ${tags ? `<div style="margin-top:5px;font-size:11px;color:var(--text-dim)">🏷 ${esc(tags)}</div>` : ''}
+    `;
+    tip.style.display = 'block';
+    const tw = 234, th = 115;
+    const cw = rect.width, ch = rect.height;
+    tip.style.left = (mx + 14 + tw > cw ? mx - tw - 8 : mx + 14) + 'px';
+    tip.style.top  = (my + th     > ch ? my - th      : my - 10)  + 'px';
+  }
+
+  _draw() {
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = null; this._render(); });
+  }
+
+  _color(t) {
+    switch (this.mode) {
+      case 'energy': {
+        const e = (t.energy || 5) / 10;
+        if (e <= 0.5) {
+          const f = e * 2;
+          return `rgb(${Math.round(59+80*f)},${Math.round(130-38*f)},246)`;
+        }
+        const f = (e - 0.5) * 2;
+        return `rgb(${Math.round(139+100*f)},${Math.round(92-24*f)},${Math.round(246-178*f)})`;
+      }
+      case 'genre': return this._gColors[t.genre || 'Other'] || '#555566';
+      case 'bpm': {
+        const b = Math.min(Math.max(((t.bpm||120) - 80) / 80, 0), 1);
+        return `rgb(${Math.round(59+180*b)},${Math.round(130-62*b)},${Math.round(246-187*b)})`;
+      }
+      case 'tags': {
+        const tag = (t.my_tags||[])[0];
+        if (!tag) return '#444455';
+        let h = 5381;
+        for (let i = 0; i < tag.length; i++) h = ((h * 33) ^ tag.charCodeAt(i)) >>> 0;
+        return `hsl(${h % 360},62%,56%)`;
+      }
+    }
+    return '#8b5cf6';
+  }
+
+  _render() {
+    const ctx = this.ctx;
+    const w   = this.canvas.width  / this._dpr;
+    const h   = this.canvas.height / this._dpr;
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0d0d0f';
+    ctx.fillRect(0, 0, w, h);
+
+    if (!this.tracks.length) return;
+
+    const hasSet = Object.keys(this.setIds).length > 0;
+
+    // ── Background tracks ────────────────────────────────────────────────
+    for (const t of this.tracks) {
+      if (hasSet && this.setIds[t.id] !== undefined) continue;
+      const { sx, sy } = this._w2s(t.x, t.y);
+      if (sx < -12 || sx > w+12 || sy < -12 || sy > h+12) continue;
+
+      const hov = this.hovered === t;
+      const r   = hov ? 5.5 : 3.5;
+      ctx.globalAlpha = hasSet ? 0.18 : (hov ? 1 : 0.72);
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fillStyle = this._color(t);
+      ctx.fill();
+
+      if (hov && !hasSet) {
+        ctx.globalAlpha = 0.45;
+        ctx.beginPath();
+        ctx.arc(sx, sy, r + 3, 0, Math.PI * 2);
+        ctx.strokeStyle = this._color(t);
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // ── Set overlay ──────────────────────────────────────────────────────
+    if (hasSet) {
+      const entries = Object.entries(this.setIds)
+        .map(([id, pos]) => ({ id, pos, t: this.tracks.find(tr => tr.id === id) }))
+        .filter(e => e.t)
+        .sort((a, b) => a.pos - b.pos);
+
+      // Dashed connection lines
+      ctx.save();
+      ctx.setLineDash([5, 5]);
+      ctx.strokeStyle = 'rgba(139,92,246,0.45)';
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < entries.length - 1; i++) {
+        const a = this._w2s(entries[i].t.x,   entries[i].t.y);
+        const b = this._w2s(entries[i+1].t.x, entries[i+1].t.y);
+        ctx.beginPath();
+        ctx.moveTo(a.sx, a.sy);
+        ctx.lineTo(b.sx, b.sy);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Numbered dots
+      for (const { id, pos, t } of entries) {
+        const { sx, sy } = this._w2s(t.x, t.y);
+        if (sx < -24 || sx > w+24 || sy < -24 || sy > h+24) continue;
+
+        const hov = this.hovered?.id === id;
+        const r   = hov ? 11 : 9;
+
+        // Radial glow
+        const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, r + 9);
+        grd.addColorStop(0, 'rgba(139,92,246,.55)');
+        grd.addColorStop(1, 'rgba(139,92,246,0)');
+        ctx.beginPath();
+        ctx.arc(sx, sy, r + 9, 0, Math.PI * 2);
+        ctx.fillStyle = grd;
+        ctx.fill();
+
+        // Circle fill
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fillStyle = '#8b5cf6';
+        ctx.fill();
+        ctx.strokeStyle = hov ? '#fff' : 'rgba(255,255,255,.85)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Position number
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold 9px -apple-system, sans-serif`;
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(pos), sx, sy);
+      }
+    }
+
+    this._legend();
+  }
+
+  _legend() {
+    const el = document.getElementById('map-legend');
+    if (!el) return;
+
+    let html = '';
+    if (this.mode === 'energy') {
+      html = `
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);letter-spacing:.4px;margin-bottom:7px">ENERGY</div>
+        <div style="width:72px;height:7px;border-radius:4px;background:linear-gradient(to right,#3b82f6,#8b5cf6,#ef4444);margin-bottom:4px"></div>
+        <div style="display:flex;justify-content:space-between;width:72px;font-size:10px;color:var(--text-dim)"><span>Low</span><span>High</span></div>`;
+    } else if (this.mode === 'genre') {
+      const entries = Object.entries(this._gColors).slice(0, 10);
+      html = `<div style="font-size:11px;font-weight:600;color:var(--text-dim);letter-spacing:.4px;margin-bottom:6px">GENRE</div>` +
+        entries.map(([g, c]) =>
+          `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+            <div style="width:8px;height:8px;border-radius:50%;background:${c};flex-shrink:0"></div>
+            <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px">${esc(g)}</span>
+          </div>`
+        ).join('');
+    } else if (this.mode === 'bpm') {
+      html = `
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);letter-spacing:.4px;margin-bottom:7px">BPM</div>
+        <div style="width:72px;height:7px;border-radius:4px;background:linear-gradient(to right,#3b82f6,#f97316,#ef4444);margin-bottom:4px"></div>
+        <div style="display:flex;justify-content:space-between;width:72px;font-size:10px;color:var(--text-dim)"><span>80</span><span>160</span></div>`;
+    } else if (this.mode === 'tags') {
+      html = `
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);letter-spacing:.4px;margin-bottom:5px">MY TAGS</div>
+        <div style="font-size:10px;color:var(--text-dim);line-height:1.6">Each tag<br>is a distinct hue</div>`;
+    }
+
+    const n = Object.keys(this.setIds).length;
+    if (n > 0) {
+      html += `
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="width:10px;height:10px;border-radius:50%;background:#8b5cf6;border:2px solid rgba(255,255,255,.8);flex-shrink:0"></div>
+            <span style="font-size:10px;color:var(--text-muted)">${n} set tracks</span>
+          </div>
+          <div style="font-size:10px;color:var(--text-dim);margin-top:3px">Numbers = set order</div>
+        </div>`;
+    }
+
+    el.innerHTML = html;
+  }
+}
+
+// ── Map helpers ────────────────────────────────────────────────────────────
+async function loadTrackMap() {
+  if (state.mapLoaded) {
+    trackMap?.resetView();
+    return;
+  }
+
+  const statusEl  = document.getElementById('map-status');
+  const loadingEl = document.getElementById('map-loading');
+  loadingEl.style.display = 'flex';
+  statusEl.textContent = 'Computing track map…';
+
+  try {
+    const data = await api('/api/library/map');
+    state.mapLoaded = true;
+
+    const canvas = document.getElementById('map-canvas');
+    if (!trackMap) trackMap = new TrackMap(canvas);
+    trackMap.load(data);
+
+    // Apply existing setlist overlay if one was already generated
+    if (state.currentSetlist) trackMap.updateSet(state.currentSetlist);
+
+    loadingEl.style.display = 'none';
+    statusEl.textContent = `${data.length.toLocaleString()} tracks · scroll to zoom · drag to pan`;
+  } catch (e) {
+    loadingEl.style.display = 'none';
+    statusEl.textContent = `⚠ ${e.message}`;
+  }
+}
+
+function setMapColorMode(mode) {
+  document.querySelectorAll('.map-mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  trackMap?.setMode(mode);
+}
+
+function resetMapZoom() {
+  trackMap?.resetView();
+}
+
+async function rebuildTrackMap() {
+  const btn       = document.getElementById('rebuild-map-btn');
+  const statusEl  = document.getElementById('map-status');
+  const loadingEl = document.getElementById('map-loading');
+
+  // Switch to map tab so the user sees the progress
+  switchTab('map', null);
+
+  state.mapLoaded = false;
+  btn.disabled = true;
+  loadingEl.style.display = 'flex';
+  statusEl.textContent = 'Rebuilding track map…';
+
+  try {
+    const data = await api('/api/library/map?force=true');
+    state.mapLoaded = true;
+
+    const canvas = document.getElementById('map-canvas');
+    if (!trackMap) trackMap = new TrackMap(canvas);
+    trackMap.load(data);
+
+    if (state.currentSetlist) trackMap.updateSet(state.currentSetlist);
+
+    loadingEl.style.display = 'none';
+    statusEl.textContent = `${data.length.toLocaleString()} tracks · scroll to zoom · drag to pan`;
+    showToast('✅ Track map rebuilt!', 'success');
+  } catch (e) {
+    loadingEl.style.display = 'none';
+    statusEl.textContent = `⚠ Rebuild failed: ${e.message}`;
+    showToast(`❌ Rebuild failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────

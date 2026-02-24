@@ -26,7 +26,9 @@ Endpoints:
 """
 
 import asyncio
+import math
 import os
+import time as _time_module
 import uvicorn
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -79,6 +81,7 @@ library_attributes: Optional[Dict[str, Any]] = None   # dynamic — scanned at b
 _mik_library_app: Optional[MixedInKeyLibrary] = None
 
 STATIC_DIR = Path(__file__).parent / "static"
+_MAP_CACHE_PATH = Path(__file__).resolve().parent.parent / ".data" / "library_map.json"
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +351,200 @@ async def rebuild_library_index_endpoint(force: bool = False):
         )
 
     return JSONResponse(stats)
+
+
+# ---------------------------------------------------------------------------
+# Routes — Library Map (2D PCA embedding)
+# ---------------------------------------------------------------------------
+
+def _camelot_key_to_number(key_str: str) -> int:
+    """Convert a Camelot key string ('8A', '12B', …) to an integer 1–24."""
+    if not key_str:
+        return 1
+    s = str(key_str).strip()
+    try:
+        num    = int(s[:-1])
+        letter = s[-1].upper()
+        return num if letter == "A" else num + 12
+    except (ValueError, IndexError):
+        return 1
+
+
+def _compute_track_map(records: list) -> list:
+    """Build a 2-D PCA embedding of library tracks from metadata features.
+
+    Feature vector (weighted):
+      • BPM (×2.5)         – most important dimension for DJ mixing
+      • Energy (×3.0)      – highest weight; drives the arc
+      • Camelot key sin/cos (×1.5) – circular encoding preserves wheel topology
+      • Essentia mood: happy, sad, aggressive, relaxed, party (×0.8–1.5)
+      • Danceability (×0.8)
+      • Genre one-hot top-25 (×2.0)  – creates clear genre clusters
+
+    Returns a list of dicts: track metadata + ``x`` and ``y`` in [-1, 1].
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        import random; random.seed(42)
+        return [
+            {**{k: r.get(k) for k in ("id","title","artist","genre","bpm","key","energy","color","my_tags","rating")},
+             "x": random.uniform(-1, 1), "y": random.uniform(-1, 1)}
+            for r in records
+        ]
+
+    # ── 1. Collect top genres for one-hot encoding ────────────────────────────
+    genre_counts: dict[str, int] = {}
+    for rec in records:
+        g = (rec.get("genre") or "").strip()
+        if g:
+            genre_counts[g] = genre_counts.get(g, 0) + 1
+
+    top_genres = sorted(genre_counts, key=lambda x: -genre_counts[x])[:25]
+    genre_to_idx = {g: i for i, g in enumerate(top_genres)}
+    n_genres = len(top_genres)
+
+    # ── 2. Build feature rows ─────────────────────────────────────────────────
+    rows: list = []
+    valid: list = []
+
+    for rec in records:
+        bpm    = float(rec.get("bpm") or 0)
+        energy = float(rec.get("energy") or 5)
+
+        # Camelot circular key encoding
+        kn    = _camelot_key_to_number(rec.get("key") or "1A")
+        angle = (kn - 1) / 12.0 * math.pi
+        key_sin = math.sin(angle)
+        key_cos = math.cos(angle)
+
+        # Essentia mood
+        ess        = rec.get("essentia") or {}
+        mood       = ess.get("mood") or {}
+        happy      = float(mood.get("happy",      0.5))
+        sad        = float(mood.get("sad",        0.5))
+        aggressive = float(mood.get("aggressive", 0.5))
+        relaxed    = float(mood.get("relaxed",    0.5))
+        party      = float(mood.get("party",      0.5))
+        dance      = float(ess.get("danceability") or 5) / 10.0
+
+        # Genre one-hot
+        genre = (rec.get("genre") or "").strip()
+        g_vec = [0.0] * n_genres
+        if genre in genre_to_idx:
+            g_vec[genre_to_idx[genre]] = 1.0
+
+        feat = [
+            min(bpm / 180.0, 1.0) * 2.5,   # BPM
+            energy / 10.0 * 3.0,            # Energy (highest weight)
+            key_sin * 1.5,                  # Key – sin
+            key_cos * 1.5,                  # Key – cos
+            happy      * 1.0,
+            sad        * 0.8,
+            aggressive * 1.5,
+            relaxed    * 1.0,
+            party      * 1.2,
+            dance      * 0.8,
+        ] + [v * 2.0 for v in g_vec]
+
+        rows.append(feat)
+        valid.append(rec)
+
+    if not rows:
+        return []
+
+    X = np.array(rows, dtype=np.float64)
+
+    # ── 3. Standardise ────────────────────────────────────────────────────────
+    mu    = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma < 1e-8] = 1.0
+    X_std = (X - mu) / sigma
+
+    # ── 4. PCA via full SVD (top 2 components) ────────────────────────────────
+    _, _, Vt   = np.linalg.svd(X_std, full_matrices=False)
+    coords     = X_std @ Vt[:2].T           # (n, 2)
+
+    # ── 5. Centre at mean, scale by 3×std so the density cluster fills the view;
+    #       clip to [-1, 1] so outliers don't push the cloud off-screen.
+    for dim in range(2):
+        col  = coords[:, dim]
+        mean = float(col.mean())
+        std  = float(col.std())
+        if std > 1e-8:
+            coords[:, dim] = (col - mean) / (3.0 * std)
+    coords = np.clip(coords, -1.0, 1.0)
+
+    # ── 6. Assemble output ────────────────────────────────────────────────────
+    result = []
+    for i, rec in enumerate(valid):
+        result.append({
+            "id":      rec.get("id"),
+            "title":   rec.get("title"),
+            "artist":  rec.get("artist"),
+            "genre":   rec.get("genre") or "",
+            "bpm":     rec.get("bpm"),
+            "key":     rec.get("key"),
+            "energy":  rec.get("energy"),
+            "color":   rec.get("color") or "none",
+            "my_tags": rec.get("my_tags") or [],
+            "rating":  rec.get("rating") or 0,
+            "x":       float(coords[i, 0]),
+            "y":       float(coords[i, 1]),
+        })
+
+    return result
+
+
+@app.get("/api/library/map")
+async def library_map(force: bool = False):
+    """2D PCA embedding of all library tracks for scatter-plot visualization.
+
+    Encodes BPM, energy, Camelot key (circular sin/cos), Essentia mood
+    (happy/sad/aggressive/relaxed/party), danceability, and genre (one-hot
+    top-25) into a feature matrix, then projects to 2-D via PCA.
+
+    Results are cached to ``.data/library_map.json`` and reused for 1 hour.
+
+    Query params:
+        force: Recompute even if the cached result is fresh.
+    """
+    if library_index is None:
+        raise HTTPException(status_code=503, detail="Library index not initialized")
+
+    # ── Serve cache if fresh ─────────────────────────────────────────────────
+    if not force and _MAP_CACHE_PATH.exists():
+        age = _time_module.time() - _MAP_CACHE_PATH.stat().st_mtime
+        if age < 3600:
+            import json as _json
+            with open(_MAP_CACHE_PATH, encoding="utf-8") as fh:
+                return JSONResponse(_json.load(fh))
+
+    # ── Read all JSONL records ────────────────────────────────────────────────
+    import json as _json
+    records: list[dict] = []
+    path = library_index._record_path
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(_json.loads(line))
+                    except Exception:
+                        pass
+
+    # ── Compute embedding in thread executor (CPU-bound) ─────────────────────
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, _compute_track_map, records
+    )
+
+    # ── Cache and return ──────────────────────────────────────────────────────
+    _MAP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_MAP_CACHE_PATH, "w", encoding="utf-8") as fh:
+        _json.dump(result, fh)
+
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
