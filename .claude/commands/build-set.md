@@ -55,7 +55,13 @@ Below the table show:
 
 ---
 
-After presenting the set, ask:
+After presenting the set, always show the visualization paths from the result's `visualization` field:
+
+> 💾 **Saved to DJ history:**
+> - HTML: `[visualization.html_path]` — open in a browser for the interactive flow diagram
+> - JSON: `[visualization.json_path]` — raw setlist data
+
+Then ask:
 
 > **What next?**
 > - **Export to Rekordbox** — type `/export-set [playlist name]` or say "export as [name]"

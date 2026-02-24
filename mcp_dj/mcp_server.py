@@ -46,6 +46,7 @@ from .models import (
     MoodTarget,
 )
 from .library_index import LibraryIndex, LibraryIndexFeatureStore
+from .visualizer import save_set_history
 from .intent import (
     VIBE_PROFILES as _VIBE_PROFILES,
     SITUATION_TO_PROFILE as _SITUATION_TO_PROFILE,
@@ -2113,7 +2114,7 @@ async def build_set_from_prompt(
             "descriptors": mood_target_model.descriptors,
         }
 
-    return {
+    result: Dict[str, Any] = {
         "setlist_id": setlist.id,
         "name": setlist.name,
         "prompt": prompt,
@@ -2144,6 +2145,19 @@ async def build_set_from_prompt(
             for st in setlist.tracks
         ],
     }
+
+    # ── Auto-save history + HTML visualization ──
+    try:
+        saved = save_set_history(result)
+        result["visualization"] = {
+            "html_path": saved["html_path"],
+            "json_path": saved["json_path"],
+        }
+        logger.info(f"Set history saved → {saved['html_path']}")
+    except Exception as _vis_err:
+        logger.warning(f"Could not save set visualization: {_vis_err}")
+
+    return result
 
 
 @mcp.tool()

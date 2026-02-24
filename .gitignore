@@ -37,6 +37,7 @@ htmlcov/
 
 # Claude Code local settings (contains machine-specific paths)
 .claude/settings.local.json
+.claude/worktrees/
 
 # Rekordbox / Pioneer data (local DJ library - not for sharing)
 *.nml
@@ -64,3 +65,4 @@ Thumbs.db
 .data/library_index.jsonl
 .data/library_attributes.json
 .data/library_context.md
+.data/dj_history/*
