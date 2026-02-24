@@ -50,35 +50,57 @@ ENERGY_PROFILES: Dict[str, Dict[str, Any]] = {
 
 
 class EnergyPlanner:
-    """Plans energy arcs and scores track placements against target curves."""
+    """Plans energy arcs and scores track placements against target curves.
 
-    def get_target_energy(self, position_pct: float, profile: str = "journey") -> float:
+    Supports both named profiles (as fallback) and custom curves generated
+    by the LLM.  Custom curves take priority when provided.
+    """
+
+    @staticmethod
+    def _resolve_curve(
+        profile: str = "journey",
+        custom_curve: Optional[List[Tuple[float, int]]] = None,
+    ) -> List[Tuple[float, int]]:
+        """Return the energy curve, preferring *custom_curve* over a named profile."""
+        if custom_curve is not None and len(custom_curve) >= 2:
+            return sorted(custom_curve, key=lambda p: p[0])
+        return ENERGY_PROFILES.get(profile, ENERGY_PROFILES["journey"])["curve"]
+
+    @staticmethod
+    def _interpolate(curve: List[Tuple[float, int]], position_pct: float) -> float:
+        """Linearly interpolate the curve at *position_pct*."""
+        position_pct = max(0.0, min(1.0, position_pct))
+        for i in range(len(curve) - 1):
+            p1, e1 = curve[i]
+            p2, e2 = curve[i + 1]
+            if p1 <= position_pct <= p2:
+                if p2 == p1:
+                    return float(e1)
+                t = (position_pct - p1) / (p2 - p1)
+                return e1 + t * (e2 - e1)
+        return float(curve[-1][1])
+
+    # ------------------------------------------------------------------
+
+    def get_target_energy(
+        self,
+        position_pct: float,
+        profile: str = "journey",
+        custom_curve: Optional[List[Tuple[float, int]]] = None,
+    ) -> float:
         """
         Interpolate the target energy level at a given position in the set.
 
         Args:
             position_pct: Position in the set (0.0 = start, 1.0 = end)
-            profile: Energy profile name
+            profile: Named energy profile (fallback)
+            custom_curve: LLM-generated curve points — overrides *profile*
 
         Returns:
             Target energy level (1-10, can be fractional)
         """
-        position_pct = max(0.0, min(1.0, position_pct))
-        curve = ENERGY_PROFILES.get(profile, ENERGY_PROFILES["journey"])["curve"]
-
-        # Find the two nearest points for interpolation
-        for i in range(len(curve) - 1):
-            p1, e1 = curve[i]
-            p2, e2 = curve[i + 1]
-            if p1 <= position_pct <= p2:
-                # Linear interpolation
-                if p2 == p1:
-                    return float(e1)
-                t = (position_pct - p1) / (p2 - p1)
-                return e1 + t * (e2 - e1)
-
-        # Fallback: return last point's energy
-        return float(curve[-1][1])
+        curve = self._resolve_curve(profile, custom_curve)
+        return self._interpolate(curve, position_pct)
 
     def score_energy_placement(
         self,
@@ -87,6 +109,7 @@ class EnergyPlanner:
         profile: str = "journey",
         prev_energy: Optional[int] = None,
         prev_prev_energy: Optional[int] = None,
+        custom_curve: Optional[List[Tuple[float, int]]] = None,
     ) -> float:
         """
         Score how well a track's energy fits at this position.
@@ -96,7 +119,7 @@ class EnergyPlanner:
         2. Rate of change (avoid huge jumps)
         3. Avoid consecutive same-energy tracks (boring plateaus)
         """
-        target = self.get_target_energy(position_pct, profile)
+        target = self.get_target_energy(position_pct, profile, custom_curve)
         distance = abs(track_energy - target)
         base_score = max(0.0, 1.0 - (distance / 5.0))
 
@@ -121,6 +144,7 @@ class EnergyPlanner:
         current_position_pct: float,
         current_energy: int,
         profile: str = "journey",
+        custom_curve: Optional[List[Tuple[float, int]]] = None,
     ) -> Dict[str, Any]:
         """
         Advise the DJ on energy direction at the current point.
@@ -130,13 +154,13 @@ class EnergyPlanner:
              "target_energy": int,
              "reason": str}
         """
-        target = self.get_target_energy(current_position_pct, profile)
+        target = self.get_target_energy(current_position_pct, profile, custom_curve)
         target_int = round(target)
 
         # Check the derivative (direction of the curve)
         delta = 0.05
         future_pct = min(1.0, current_position_pct + delta)
-        future_target = self.get_target_energy(future_pct, profile)
+        future_target = self.get_target_energy(future_pct, profile, custom_curve)
         slope = future_target - target
 
         diff = target_int - current_energy
@@ -163,18 +187,21 @@ class EnergyPlanner:
             }
 
     def generate_target_arc(
-        self, track_count: int, profile: str = "journey"
+        self,
+        track_count: int,
+        profile: str = "journey",
+        custom_curve: Optional[List[Tuple[float, int]]] = None,
     ) -> List[int]:
         """Generate the full target energy arc for a set of N tracks."""
         if track_count <= 0:
             return []
         if track_count == 1:
-            return [round(self.get_target_energy(0.5, profile))]
+            return [round(self.get_target_energy(0.5, profile, custom_curve))]
 
         arc = []
         for i in range(track_count):
             pct = i / (track_count - 1)
-            arc.append(round(self.get_target_energy(pct, profile)))
+            arc.append(round(self.get_target_energy(pct, profile, custom_curve)))
         return arc
 
     @staticmethod

@@ -19,6 +19,9 @@ from .models import (
     Setlist,
     SetlistRequest,
     NextTrackRecommendation,
+    GenrePhase,
+    BpmCurvePoint,
+    MoodTarget,
 )
 from .camelot import CamelotWheel
 from .energy_planner import EnergyPlanner
@@ -28,6 +31,63 @@ try:
     from .essentia_analyzer import EssentiaFeatureStore
 except ImportError:
     EssentiaFeatureStore = None
+
+
+# ---------------------------------------------------------------------------
+# Mood descriptor → mood vector mapping (for MoodTarget.descriptors)
+# ---------------------------------------------------------------------------
+MOOD_DESCRIPTORS: Dict[str, Dict[str, float]] = {
+    "dark":        {"aggressive": 0.6, "sad": 0.3, "relaxed": 0.1},
+    "hypnotic":    {"relaxed": 0.5, "party": 0.3, "sad": 0.2},
+    "uplifting":   {"happy": 0.6, "party": 0.3, "relaxed": 0.1},
+    "emotional":   {"sad": 0.4, "happy": 0.3, "relaxed": 0.3},
+    "energetic":   {"party": 0.5, "aggressive": 0.3, "happy": 0.2},
+    "dreamy":      {"relaxed": 0.6, "sad": 0.2, "happy": 0.2},
+    "aggressive":  {"aggressive": 0.8, "party": 0.2},
+    "groovy":      {"party": 0.4, "happy": 0.4, "relaxed": 0.2},
+    "melancholic": {"sad": 0.6, "relaxed": 0.3, "happy": 0.1},
+    "euphoric":    {"happy": 0.5, "party": 0.4, "aggressive": 0.1},
+    "minimal":     {"relaxed": 0.5, "sad": 0.3, "party": 0.2},
+    "driving":     {"aggressive": 0.4, "party": 0.4, "happy": 0.2},
+    "trippy":      {"relaxed": 0.4, "party": 0.3, "sad": 0.3},
+    "warm":        {"happy": 0.4, "relaxed": 0.4, "party": 0.2},
+    "intense":     {"aggressive": 0.5, "party": 0.4, "happy": 0.1},
+    "chill":       {"relaxed": 0.7, "happy": 0.2, "sad": 0.1},
+    "funky":       {"happy": 0.5, "party": 0.4, "relaxed": 0.1},
+    "deep":        {"relaxed": 0.4, "sad": 0.3, "party": 0.3},
+    "heavy":       {"aggressive": 0.7, "party": 0.2, "sad": 0.1},
+    "melodic":     {"happy": 0.4, "relaxed": 0.3, "sad": 0.3},
+    "raw":         {"aggressive": 0.6, "party": 0.3, "sad": 0.1},
+    "atmospheric": {"relaxed": 0.5, "sad": 0.3, "happy": 0.2},
+    "bouncy":      {"party": 0.5, "happy": 0.4, "aggressive": 0.1},
+    "industrial":  {"aggressive": 0.7, "sad": 0.2, "party": 0.1},
+    "acid":        {"aggressive": 0.4, "party": 0.4, "relaxed": 0.2},
+}
+
+# ---------------------------------------------------------------------------
+# Rekordbox color → energy/mood association
+# ---------------------------------------------------------------------------
+COLOR_ENERGY_MAP: Dict[str, Dict[str, float]] = {
+    "red":    {"energy_center": 8, "aggressive": 0.5, "party": 0.3},
+    "orange": {"energy_center": 7, "party": 0.5, "happy": 0.3},
+    "yellow": {"energy_center": 6, "happy": 0.6, "party": 0.3},
+    "green":  {"energy_center": 5, "party": 0.4, "happy": 0.3, "relaxed": 0.2},
+    "aqua":   {"energy_center": 4, "relaxed": 0.4, "happy": 0.3, "party": 0.2},
+    "blue":   {"energy_center": 3, "relaxed": 0.6, "sad": 0.2},
+    "purple": {"energy_center": 7, "aggressive": 0.4, "sad": 0.3, "party": 0.2},
+    "pink":   {"energy_center": 5, "happy": 0.4, "relaxed": 0.3, "party": 0.2},
+}
+
+# ---------------------------------------------------------------------------
+# Energy source reliability (higher = more trustworthy)
+# ---------------------------------------------------------------------------
+ENERGY_SOURCE_WEIGHT: Dict[str, float] = {
+    "mik": 1.0,
+    "manual": 0.9,
+    "album_tag": 0.7,
+    "inferred": 0.5,
+    "none": 0.4,
+}
 
 
 class SetlistEngine:
@@ -96,9 +156,9 @@ class SetlistEngine:
 
         Algorithm:
         1. Determine target track count from duration
-        2. Filter candidates by genre/BPM constraints
+        2. Filter candidates by genre/BPM/My Tag constraints
         3. Select starting track
-        4. Greedily select each subsequent track by scoring candidates
+        4. Greedily select each subsequent track using full metadata scoring
         """
         if not self.tracks:
             raise RuntimeError("Engine not initialized with tracks")
@@ -106,6 +166,9 @@ class SetlistEngine:
         # Estimate track count: average track ~6 minutes
         avg_track_len = self._avg_track_length()
         target_count = max(3, round((request.duration_minutes * 60) / avg_track_len))
+
+        # Extract custom energy curve from request (LLM-generated)
+        energy_curve = self._get_energy_curve(request)
 
         # Filter candidate pool
         candidates = self._filter_candidates(request)
@@ -164,6 +227,10 @@ class SetlistEngine:
                     prev_prev_energy=prev_prev_energy,
                     recent_artists=recent_artists[-5:],
                     recent_genres=recent_genres[-3:],
+                    custom_energy_curve=energy_curve,
+                    genre_phases=request.genre_phases,
+                    bpm_curve=request.bpm_curve,
+                    mood_target=request.mood_target,
                 )
                 if score > best_score:
                     best_score = score
@@ -359,32 +426,31 @@ class SetlistEngine:
         prev_prev_energy: Optional[int],
         recent_artists: List[str],
         recent_genres: List[str],
+        # --- LLM-structured parameters ---
+        custom_energy_curve: Optional[List[Tuple[float, int]]] = None,
+        genre_phases: Optional[List[GenrePhase]] = None,
+        bpm_curve: Optional[List[BpmCurvePoint]] = None,
+        mood_target: Optional[MoodTarget] = None,
     ) -> Tuple[float, float, str]:
         """
-        Score a candidate track. Returns (total_score, harmonic_score, key_relation).
+        Score a candidate track using ALL available metadata.
+        Returns (total_score, harmonic_score, key_relation).
 
-        Weights adapt based on Essentia data availability:
-
-        Without Essentia (metadata only):
-          harmonic:     0.35
-          energy:       0.30
-          bpm:          0.15
-          genre:        0.10
-          diversity:    0.05
-          quality:      0.05
-
-        With Essentia (objective audio features):
-          harmonic:        0.28
-          energy:          0.22  (LUFS-derived, objective)
-          bpm:             0.11  (Essentia BPM, more accurate)
-          genre:           0.09  (Rekordbox 60% + Discogs cosine 40%)
-          mood_similarity: 0.08  (track-to-track cosine similarity of mood vectors)
-          danceability:    0.06  (normalized from Essentia's 0-3 range)
-          mood_position:   0.04  (position-aware: party/happy at peak, relaxed at low)
-          tags_similarity: 0.04  (track-to-track cosine similarity of music tag vectors)
-          diversity:       0.04
-          quality:         0.02
-          data bonus:     +0.02  (preference for analyzed tracks when scores are close)
+        Scoring dimensions (with Essentia + structured params):
+          harmonic (key confidence weighted): 0.24
+          energy (custom curve or profile):   0.18
+          bpm (proximity + curve blended):    0.10
+          genre (phase-aware if phases):      0.09
+          mood similarity (track-to-track):   0.07
+          mood target (user intent):          0.06
+          danceability:                       0.05
+          tags similarity:                    0.04
+          my_tag similarity:                  0.04
+          loudness range similarity:          0.03
+          color-energy alignment:             0.03
+          diversity:                          0.03
+          quality:                            0.02
+          essentia bonus:                     0.02
         """
         # Harmonic score
         h_score, rel = self.camelot.transition_score(
@@ -395,18 +461,35 @@ class SetlistEngine:
         ess = self.essentia_store.get(candidate.file_path) if self.essentia_store else None
         ess_current = self.essentia_store.get(current_track.file_path) if self.essentia_store else None
 
+        # Key confidence weighting — higher confidence = more reliable harmonic match
+        key_confidence = 1.0
+        if ess is not None and hasattr(ess, "key_strength") and ess.key_strength > 0:
+            # Boost h_score reliability: blend toward 1.0 (full trust) at high confidence
+            key_confidence = 0.5 + 0.5 * ess.key_strength
+
         # Effective energy: Essentia LUFS-derived energy takes priority when available
         cand_energy = ess.energy_as_1_to_10() if ess is not None else (candidate.energy or 5)
 
-        # Energy score (how well the candidate fits the energy arc at this position)
+        # Energy score: fits the custom curve (LLM) or named profile (fallback)
         energy_score = self.planner.score_energy_placement(
-            cand_energy, position_pct, profile, prev_energy, prev_prev_energy
+            cand_energy, position_pct, profile, prev_energy, prev_prev_energy,
+            custom_curve=custom_energy_curve,
         )
+
+        # Energy source reliability multiplier
+        source_weight = ENERGY_SOURCE_WEIGHT.get(candidate.energy_source, 0.4)
+        if ess is not None:
+            source_weight = 1.0  # Essentia energy is always fully reliable
 
         # BPM score — use Essentia BPM if available (more accurate than Rekordbox)
         candidate_bpm = ess.bpm_essentia if (ess and ess.bpm_essentia > 0) else candidate.bpm
         current_bpm = ess_current.bpm_essentia if (ess_current and ess_current.bpm_essentia > 0) else current_track.bpm
         bpm_score = self._bpm_score(current_bpm, candidate_bpm)
+
+        # BPM curve: blend proximity score with target curve score
+        if bpm_curve:
+            bpm_curve_sc = self._bpm_curve_score(candidate_bpm, position_pct, bpm_curve)
+            bpm_score = 0.4 * bpm_score + 0.6 * bpm_curve_sc
 
         # Genre score — blend Rekordbox + Discogs genre when both available
         genre_score = self._genre_score(current_track.genre, candidate.genre)
@@ -414,6 +497,30 @@ class SetlistEngine:
             discogs_score = self._discogs_genre_score(ess_current.genre_discogs, ess.genre_discogs)
             if discogs_score is not None:
                 genre_score = 0.6 * genre_score + 0.4 * discogs_score
+
+        # Genre phases: position-aware genre matching
+        if genre_phases:
+            phase_score = self._genre_phase_score(candidate.genre, position_pct, genre_phases)
+            genre_score = 0.3 * genre_score + 0.7 * phase_score
+
+        # My Tag similarity: shared tags between consecutive tracks = smoother flow
+        my_tag_sim = self._my_tag_similarity(candidate.my_tags, current_track.my_tags)
+
+        # Loudness range similarity: similar dynamic range = smoother mixing
+        loudness_range_sim = 0.5  # neutral default
+        if ess is not None and ess_current is not None:
+            loudness_range_sim = self._loudness_range_similarity(
+                getattr(ess_current, "loudness_range_db", 0),
+                getattr(ess, "loudness_range_db", 0),
+            )
+
+        # Color-energy alignment
+        color_score = 0.5  # neutral default
+        if candidate.color and candidate.color != "none":
+            target_energy = self.planner.get_target_energy(
+                position_pct, profile, custom_energy_curve
+            )
+            color_score = self._color_energy_score(candidate.color, target_energy)
 
         # Diversity penalty
         diversity = 1.0
@@ -432,17 +539,14 @@ class SetlistEngine:
             quality = min(1.0, quality + 0.1)
 
         if ess is not None:
-            # --- Essentia data available: use dynamic weights where danceability and
-            # mood are first-class scoring dimensions, not minor bonuses.
-            # Weights drawn from reduced harmonic/energy/bpm to keep total ≈ 1.0.
-            # A small essentia_data_bonus biases toward analyzed tracks when scores
-            # are otherwise equal.
-            target_energy_level = self.planner.get_target_energy(position_pct, profile)
+            target_energy_level = self.planner.get_target_energy(
+                position_pct, profile, custom_energy_curve
+            )
 
             # Danceability: 0-1 score, normalized from Essentia's 0-3 range
             danceability_score = ess.danceability_as_1_to_10() / 10.0
 
-            # Mood: 0-1 score matched to the set position's energy target
+            # Mood: position-aware scoring
             if target_energy_level >= 7:
                 mood_score = max(
                     ess.mood_party or 0.0,
@@ -452,11 +556,15 @@ class SetlistEngine:
             elif target_energy_level <= 4:
                 mood_score = ess.mood_relaxed or 0.0
             else:
-                # Mid-energy: reward happy/party, mild credit for relaxed
                 mood_score = (
                     0.6 * max(ess.mood_happy or 0.0, ess.mood_party or 0.0)
                     + 0.4 * (ess.mood_relaxed or 0.0)
                 )
+
+            # If user specified a mood target, blend it in
+            if mood_target:
+                mood_target_sc = self._mood_target_score(ess, mood_target)
+                mood_score = 0.3 * mood_score + 0.7 * mood_target_sc
 
             # Track-to-track mood and tags vector similarity (cosine)
             mood_sim = self._mood_vector_similarity(ess_current, ess)
@@ -464,29 +572,39 @@ class SetlistEngine:
             tags_sim = self._music_tags_similarity(ess_current, ess)
             tags_sim = tags_sim if tags_sim is not None else 0.5
 
+            # Full metadata scoring — all dimensions
             total = (
-                0.28 * h_score
-                + 0.22 * energy_score
-                + 0.11 * bpm_score
-                + 0.09 * genre_score
-                + 0.08 * mood_sim            # track-to-track mood vector match
-                + 0.06 * danceability_score
-                + 0.04 * mood_score          # position-aware mood target
-                + 0.04 * tags_sim            # track-to-track music tags match
-                + 0.04 * diversity
-                + 0.02 * quality
-                + 0.02                       # essentia data availability bonus
+                0.24 * h_score * key_confidence  # harmonic (key confidence weighted)
+                + 0.18 * energy_score * source_weight  # energy (source reliability weighted)
+                + 0.10 * bpm_score               # BPM (proximity + curve)
+                + 0.09 * genre_score             # genre (phase-aware if phases provided)
+                + 0.07 * mood_sim                # track-to-track mood vector match
+                + 0.06 * mood_score              # mood target / position-aware
+                + 0.05 * danceability_score      # danceability
+                + 0.04 * tags_sim                # music tags similarity
+                + 0.04 * my_tag_sim              # My Tag overlap
+                + 0.03 * loudness_range_sim      # dynamic range matching
+                + 0.03 * color_score             # color → energy/mood alignment
+                + 0.03 * diversity               # artist/genre repetition penalty
+                + 0.02 * quality                 # rating + play_count
+                + 0.02                           # essentia data availability bonus
             )
         else:
-            # --- No Essentia data: fall back to metadata-only weights
+            # --- No Essentia data: metadata-only weights
             total = (
-                0.35 * h_score
-                + 0.30 * energy_score
-                + 0.15 * bpm_score
+                0.30 * h_score
+                + 0.25 * energy_score
+                + 0.13 * bpm_score
                 + 0.10 * genre_score
-                + 0.05 * diversity
-                + 0.05 * quality
+                + 0.06 * my_tag_sim              # My Tags still available without Essentia
+                + 0.04 * diversity
+                + 0.04 * quality
+                + 0.04 * color_score             # Color still available without Essentia
             )
+            # Blend BPM curve if available (works without Essentia)
+            if bpm_curve:
+                bpm_curve_sc = self._bpm_curve_score(candidate.bpm, position_pct, bpm_curve)
+                total += 0.04 * bpm_curve_sc
 
         return (total, h_score, rel)
 
@@ -584,6 +702,146 @@ class SetlistEngine:
             return None
         return min(1.0, dot / (mag_a * mag_b))
 
+    # ------------------------------------------------------------------
+    # New scoring dimensions (genre phases, BPM curve, mood target, etc.)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _genre_phase_score(
+        candidate_genre: Optional[str],
+        position_pct: float,
+        genre_phases: List[GenrePhase],
+    ) -> float:
+        """Score how well a candidate's genre matches the target at this position."""
+        if not candidate_genre or not genre_phases:
+            return 0.5
+        cand_lower = candidate_genre.lower()
+        best_match = 0.0
+
+        for phase in genre_phases:
+            if phase.start <= position_pct <= phase.end:
+                target_lower = phase.genre.lower()
+                if target_lower == cand_lower:
+                    match = 1.0
+                elif target_lower in cand_lower or cand_lower in target_lower:
+                    match = 0.7
+                else:
+                    target_words = set(target_lower.split())
+                    cand_words = set(cand_lower.split())
+                    if target_words & cand_words:
+                        match = 0.5
+                    else:
+                        match = 0.1
+                match *= phase.weight
+                best_match = max(best_match, match)
+
+        return best_match if best_match > 0 else 0.5
+
+    @staticmethod
+    def _bpm_curve_score(
+        candidate_bpm: float,
+        position_pct: float,
+        bpm_curve: List[BpmCurvePoint],
+    ) -> float:
+        """Score how well a candidate's BPM matches the target at this position."""
+        if candidate_bpm <= 0 or not bpm_curve:
+            return 0.5
+
+        sorted_pts = sorted(bpm_curve, key=lambda p: p.position)
+        target_bpm = sorted_pts[-1].bpm  # fallback to last point
+
+        for i in range(len(sorted_pts) - 1):
+            p1, p2 = sorted_pts[i], sorted_pts[i + 1]
+            if p1.position <= position_pct <= p2.position:
+                if p2.position == p1.position:
+                    target_bpm = p1.bpm
+                else:
+                    t = (position_pct - p1.position) / (p2.position - p1.position)
+                    target_bpm = p1.bpm + t * (p2.bpm - p1.bpm)
+                break
+
+        pct_diff = abs(candidate_bpm - target_bpm) / target_bpm * 100
+        return max(0.0, 1.0 - (pct_diff / 8.0))
+
+    @staticmethod
+    def _mood_target_score(ess, mood_target: MoodTarget) -> float:
+        """Score how well a candidate's mood matches the user's target mood."""
+        if ess is None or mood_target is None:
+            return 0.5
+
+        # Build target mood vector from explicit moods + descriptors
+        target_vec: Dict[str, float] = dict(mood_target.moods)
+        for desc in mood_target.descriptors:
+            desc_lower = desc.lower()
+            if desc_lower in MOOD_DESCRIPTORS:
+                for mood_name, weight in MOOD_DESCRIPTORS[desc_lower].items():
+                    target_vec[mood_name] = target_vec.get(mood_name, 0) + weight
+
+        if not target_vec:
+            return 0.5
+
+        # Normalize
+        total = sum(target_vec.values())
+        if total > 0:
+            target_vec = {k: v / total for k, v in target_vec.items()}
+
+        # Build candidate mood vector
+        cand_vec = {
+            "happy": getattr(ess, "mood_happy", None) or 0.0,
+            "sad": getattr(ess, "mood_sad", None) or 0.0,
+            "aggressive": getattr(ess, "mood_aggressive", None) or 0.0,
+            "relaxed": getattr(ess, "mood_relaxed", None) or 0.0,
+            "party": getattr(ess, "mood_party", None) or 0.0,
+        }
+
+        # Cosine similarity
+        all_moods = set(target_vec) | set(cand_vec)
+        dot = sum(target_vec.get(m, 0) * cand_vec.get(m, 0) for m in all_moods)
+        mag_t = sum(v ** 2 for v in target_vec.values()) ** 0.5
+        mag_c = sum(v ** 2 for v in cand_vec.values()) ** 0.5
+        if mag_t == 0 or mag_c == 0:
+            return 0.5
+        return min(1.0, dot / (mag_t * mag_c))
+
+    @staticmethod
+    def _my_tag_similarity(tags_a: List[str], tags_b: List[str]) -> float:
+        """Jaccard similarity of My Tag sets — shared tags = smoother flow."""
+        if not tags_a or not tags_b:
+            return 0.5
+        set_a, set_b = set(tags_a), set(tags_b)
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        if union == 0:
+            return 0.5
+        return intersection / union
+
+    @staticmethod
+    def _color_energy_score(color: str, target_energy: float) -> float:
+        """Score how well a track's color label aligns with the target energy."""
+        color_lower = color.lower() if color else ""
+        info = COLOR_ENERGY_MAP.get(color_lower)
+        if not info:
+            return 0.5
+        energy_center = info["energy_center"]
+        distance = abs(target_energy - energy_center)
+        return max(0.0, 1.0 - (distance / 5.0))
+
+    @staticmethod
+    def _loudness_range_similarity(range_a: float, range_b: float) -> float:
+        """Score closeness of loudness range (dynamic range) — similar = smoother mixing."""
+        if range_a == 0 or range_b == 0:
+            return 0.5
+        diff = abs(range_a - range_b)
+        # 0 dB diff = 1.0, 10 dB diff = 0.0
+        return max(0.0, 1.0 - (diff / 10.0))
+
+    @staticmethod
+    def _get_energy_curve(request: SetlistRequest) -> Optional[List[Tuple[float, int]]]:
+        """Extract custom energy curve from request as raw tuples."""
+        if request.energy_curve:
+            return [(p.position, p.energy) for p in request.energy_curve]
+        return None
+
     def _avg_track_length(self) -> float:
         """Average track length in seconds across the library."""
         lengths = [t.length for t in self.tracks if t.length > 0]
@@ -608,18 +866,31 @@ class SetlistEngine:
             if track:
                 return track
 
-        # Find a track matching the profile's opening energy
-        target_energy = round(self.planner.get_target_energy(0.0, request.energy_profile))
-        available = [t for t in candidates if t.id not in used_ids]
+        # Opening energy from custom curve or named profile
+        energy_curve = self._get_energy_curve(request)
+        target_energy = round(self.planner.get_target_energy(
+            0.0, request.energy_profile, custom_curve=energy_curve,
+        ))
 
+        # Opening genre from first genre phase (if present)
+        starting_genre = None
+        if request.genre_phases:
+            for phase in request.genre_phases:
+                if phase.start <= 0.05:
+                    starting_genre = phase.genre.lower()
+                    break
+
+        available = [t for t in candidates if t.id not in used_ids]
         if not available:
             available = [t for t in self.tracks if t.id not in used_ids]
 
-        # Sort by closeness to target opening energy, then by rating.
-        # Use Essentia energy when available for an objective energy reading.
         def start_score(t: TrackWithEnergy) -> float:
             e_diff = abs(self._effective_energy(t) - target_energy)
-            return -e_diff + (t.rating / 10.0)
+            score = -e_diff + (t.rating / 10.0)
+            # Strong genre preference for opening if phases specified
+            if starting_genre and t.genre and starting_genre in t.genre.lower():
+                score += 2.0
+            return score
 
         available.sort(key=start_score, reverse=True)
 
@@ -628,10 +899,29 @@ class SetlistEngine:
         return random.choice(top) if top else available[0]
 
     def _filter_candidates(self, request: SetlistRequest) -> List[TrackWithEnergy]:
-        """Filter tracks by genre and BPM constraints from the request."""
+        """Filter tracks by My Tags, genre (phases or single), and BPM constraints."""
         candidates = self.tracks
 
-        if request.genre:
+        # My Tag filtering
+        if request.my_tags:
+            tag_set = set(request.my_tags)
+            tag_filtered = [
+                t for t in candidates
+                if tag_set & set(t.my_tags)
+            ]
+            if len(tag_filtered) >= 10:
+                candidates = tag_filtered
+
+        # Genre filtering: multi-genre via phases or single genre
+        if request.genre_phases:
+            all_phase_genres = {phase.genre.lower() for phase in request.genre_phases}
+            genre_filtered = [
+                t for t in candidates
+                if t.genre and any(g in t.genre.lower() for g in all_phase_genres)
+            ]
+            if len(genre_filtered) >= 10:
+                candidates = genre_filtered
+        elif request.genre:
             genre_lower = request.genre.lower()
             genre_filtered = [
                 t for t in candidates
@@ -640,10 +930,22 @@ class SetlistEngine:
             if len(genre_filtered) >= 10:
                 candidates = genre_filtered
 
-        if request.bpm_min is not None:
-            candidates = [t for t in candidates if t.bpm >= request.bpm_min]
-        if request.bpm_max is not None:
-            candidates = [t for t in candidates if t.bpm <= request.bpm_max]
+        # BPM filtering: use curve bounds if available, else global min/max
+        if request.bpm_curve:
+            curve_bpms = [p.bpm for p in request.bpm_curve]
+            effective_min = min(curve_bpms) * 0.92  # 8% tolerance
+            effective_max = max(curve_bpms) * 1.08
+            bpm_filtered = [
+                t for t in candidates
+                if effective_min <= t.bpm <= effective_max
+            ]
+            if len(bpm_filtered) >= 10:
+                candidates = bpm_filtered
+        else:
+            if request.bpm_min is not None:
+                candidates = [t for t in candidates if t.bpm >= request.bpm_min]
+            if request.bpm_max is not None:
+                candidates = [t for t in candidates if t.bpm <= request.bpm_max]
 
         return candidates
 
