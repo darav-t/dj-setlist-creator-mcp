@@ -713,10 +713,11 @@ async function sendMessage() {
     if (data.setlist) {
       state.currentSetlist = data.setlist;
       renderSetlist(data.setlist);
-      switchTab('setlist', document.querySelector('.viz-tab'));
       renderCharts(data.setlist);
       document.getElementById('export-btn').disabled = false;
-      trackMap?.updateSet(data.setlist);
+      // Auto-switch to Track Map and apply set overlay
+      switchTab('map', null);
+      if (trackMap) trackMap.updateSet(data.setlist);
     }
     if (data.recommendations) {
       state.currentRecs = data.recommendations;
