@@ -22,14 +22,16 @@ To run over HTTP (SSE) for remote or multi-client access:
 """
 
 import asyncio
+import json
 import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any
 
 from fastmcp import FastMCP
 from loguru import logger
+from pydantic import BeforeValidator
 
 from .database import RekordboxDatabase
 from .energy import MixedInKeyLibrary, EnergyResolver
@@ -1807,15 +1809,32 @@ async def analyze_library_essentia(
 # ---------------------------------------------------------------------------
 
 
+def _parse_json_str(v: Any) -> Any:
+    """Parse JSON-encoded strings into Python objects.
+
+    FastMCP validates tool parameters before calling the function.  When an
+    LLM passes a list/dict argument as a JSON string (e.g. energy_curve as
+    '[{"position": 0.0, "energy": 7}]'), Pydantic v2 rejects it with
+    "Input should be a valid list".  Using this as a BeforeValidator lets
+    Pydantic coerce the string before type-checking it.
+    """
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return v
+
+
 @mcp.tool()
 async def build_set_from_prompt(
     prompt: str,
     duration_minutes: int = 60,
-    energy_curve: Optional[List[Dict[str, Any]]] = None,
-    genre_phases: Optional[List[Dict[str, Any]]] = None,
-    bpm_curve: Optional[List[Dict[str, Any]]] = None,
-    mood_target: Optional[Dict[str, Any]] = None,
-    my_tags: Optional[List[str]] = None,
+    energy_curve: Annotated[Optional[List[Dict[str, Any]]], BeforeValidator(_parse_json_str)] = None,
+    genre_phases: Annotated[Optional[List[Dict[str, Any]]], BeforeValidator(_parse_json_str)] = None,
+    bpm_curve: Annotated[Optional[List[Dict[str, Any]]], BeforeValidator(_parse_json_str)] = None,
+    mood_target: Annotated[Optional[Dict[str, Any]], BeforeValidator(_parse_json_str)] = None,
+    my_tags: Annotated[Optional[List[str]], BeforeValidator(_parse_json_str)] = None,
     genre: Optional[str] = None,
     bpm_min: Optional[float] = None,
     bpm_max: Optional[float] = None,
@@ -2130,7 +2149,7 @@ async def build_set_from_prompt(
 @mcp.tool()
 async def find_tracks_for_prompt(
     prompt: str,
-    my_tags: Optional[List[str]] = None,
+    my_tags: Annotated[Optional[List[str]], BeforeValidator(_parse_json_str)] = None,
     genre: Optional[str] = None,
     bpm_min: Optional[float] = None,
     bpm_max: Optional[float] = None,

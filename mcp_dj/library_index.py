@@ -709,6 +709,7 @@ class _LibraryEssentiaRecord:
         "_ess", "bpm_essentia",
         "mood_happy", "mood_sad", "mood_aggressive", "mood_relaxed", "mood_party",
         "genre_discogs", "music_tags",
+        "integrated_lufs",
     )
 
     def __init__(self, ess: dict) -> None:
@@ -732,6 +733,9 @@ class _LibraryEssentiaRecord:
             [{"tag": t, "score": s} for t, s in tags_dict.items()]
             if tags_dict else None
         )
+
+        # LUFS: JSONL key is "lufs"; callers expect the EssentiaFeatures attribute name
+        self.integrated_lufs: float = float(ess.get("lufs") or 0.0)
 
     def energy_as_1_to_10(self) -> int:
         """Already pre-computed in the JSONL from integrated_lufs."""

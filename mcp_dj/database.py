@@ -554,13 +554,14 @@ class RekordboxDatabase:
         folder = self.find_folder(folder_name)
         if folder is None:
             raise ValueError(f"Folder '{folder_name}' not found")
-        results = list(self.db.get_playlist(ID=playlist_id))
+        # Query by ParentID (known-working filter) then match ID locally.
+        # Using get_playlist(ID=playlist_id) can iterate as characters on some
+        # pyrekordbox versions, causing "'str' object has no attribute 'ParentID'".
+        all_in_folder = list(self.db.get_playlist(ParentID=folder.ID))
+        results = [p for p in all_in_folder if str(getattr(p, "ID", "")) == str(playlist_id)]
         if not results:
-            raise ValueError(f"Playlist {playlist_id} not found")
-        pl = results[0]
-        if str(pl.ParentID) != str(folder.ID):
-            raise ValueError(f"Playlist '{pl.Name}' is not inside folder '{folder_name}'")
-        return pl
+            raise ValueError(f"Playlist {playlist_id} not found in folder '{folder_name}'")
+        return results[0]
 
     async def list_playlists_in_folder(self, folder_name: str) -> List[dict]:
         """List all playlists inside the named folder (not sub-folders)."""
